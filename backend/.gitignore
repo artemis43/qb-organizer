@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.pyc
+data/chroma_db/
+data/checkpoints/
+data/exports/
+data/logs/
+data/textbooks/
+data/question_papers/
+data/*.sqlite
+*.egg-info/
+dist/
+build/
+.venv/
+venv/

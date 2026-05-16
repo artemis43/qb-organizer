@@ -1,0 +1,41 @@
+# QB Organizer - Python Backend Dependencies
+
+# === Web Framework ===
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+sse-starlette==2.2.1
+
+# === Claude API ===
+anthropic==0.43.0
+httpx==0.28.1
+
+# === PDF Processing ===
+PyMuPDF==1.25.3
+
+# === Vector Database ===
+chromadb==0.6.3
+
+# === Embeddings (Local) ===
+sentence-transformers==3.4.1
+torch>=2.6.0
+
+# === NLP (Local) ===
+spacy==3.8.4
+
+# === Database ===
+aiosqlite==0.20.0
+
+# === Data Validation ===
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# === Utilities ===
+python-dotenv==1.0.1
+rich==13.9.4
+tenacity==9.0.0
+rapidfuzz==3.11.0
+numpy==2.2.1
+
+# === Firebase (Firestore push) ===
+firebase-admin>=6.0.0

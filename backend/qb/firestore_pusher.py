@@ -1,0 +1,323 @@
+# qb-organizer/backend/qb/firestore_pusher.py
+"""Direct Firestore push for question bank content.
+
+Pushes generated QB questions + answers directly into the MBBS Companion
+app's Firestore, matching the exact schema the app expects:
+
+  subjects → chapters → questions + answers
+
+Answers with images are first uploaded to ImageKit, then the CDN URLs
+are stored in Firestore — exactly as the admin dashboard does it.
+"""
+
+import json
+import logging
+from pathlib import Path
+
+from config import settings
+from state import db as database
+from matching.matcher import find_duplicate_questions
+
+logger = logging.getLogger(__name__)
+
+# Lazy-loaded Firestore client (reuses viva module's init)
+_firestore_client = None
+
+
+def _get_firestore():
+    """Initialize and return Firestore client (lazy singleton)."""
+    global _firestore_client
+    if _firestore_client is not None:
+        return _firestore_client
+
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+
+    sa_path = settings.firebase_service_account_path
+    if not Path(sa_path).exists():
+        raise FileNotFoundError(
+            f"Firebase service account not found at: {sa_path}\n"
+            f"Download from: Firebase Console → Project Settings → Service Accounts"
+        )
+
+    if not firebase_admin._apps:
+        cred = credentials.Certificate(sa_path)
+        firebase_admin.initialize_app(cred)
+
+    _firestore_client = firestore.client()
+    logger.info("Firestore client initialized for QB push")
+    return _firestore_client
+
+
+async def push_qb_to_firestore(
+    subject: str,
+    mapping_ids: list[str] = None,
+    upload_images: bool = True,
+    progress_callback=None,
+) -> dict:
+    """Push question bank questions + answers to Firestore.
+
+    If mapping_ids is None, pushes all reviewed/high-confidence mappings
+    for the subject. Handles deduplication, image upload, and answer linking.
+
+    Args:
+        subject: Subject name
+        mapping_ids: Specific mapping IDs to push (or all if None)
+        upload_images: Whether to upload images to ImageKit
+        progress_callback: SSE progress callback
+
+    Returns:
+        Stats dict with counts
+    """
+    async def notify(msg, current=0, total=0):
+        if progress_callback:
+            await progress_callback("qb_push", current, total, msg)
+        logger.info(msg)
+
+    await notify("Loading question data...", 0, 4)
+
+    # Load mappings
+    if mapping_ids:
+        mappings = []
+        for mid in mapping_ids:
+            m = await database.fetch_one("mappings", mid)
+            if m:
+                mappings.append(m)
+    else:
+        mappings = await database.fetch_all(
+            "mappings",
+            "qp_id IN (SELECT id FROM question_papers WHERE subject = ?) "
+            "AND (is_reviewed = 1 OR confidence_level = 'high')",
+            (subject,),
+        )
+
+    if not mappings:
+        return {"error": "No eligible questions found", "pushed": 0}
+
+    # Load chapters
+    chapters = await database.fetch_all(
+        "chapters",
+        "textbook_id IN (SELECT id FROM textbooks WHERE subject = ?)",
+        (subject,), "chapter_number ASC",
+    )
+
+    textbooks = await database.fetch_all("textbooks", "subject = ?", (subject,))
+    textbook_name = textbooks[0]["name"] if textbooks else subject
+
+    await notify(f"Processing {len(mappings)} questions...", 1, 4)
+
+    # Deduplication
+    all_questions = [{"id": m["id"], "question_text": m["question_text"]} for m in mappings]
+    dup_groups = find_duplicate_questions(all_questions)
+    dup_map = {}
+    for group_idx, group in enumerate(dup_groups):
+        for q_id in group:
+            dup_map[q_id] = f"dup_{group_idx}"
+
+    # Initialize Firestore
+    try:
+        db = _get_firestore()
+    except Exception as e:
+        return {"error": str(e), "pushed": 0}
+
+    # ── Find or create subject ──
+    await notify("Creating Firestore hierarchy...", 2, 4)
+
+    subj_ref = db.collection("subjects")
+    existing_subj = subj_ref.where("name", "==", subject).limit(1).get()
+    if existing_subj:
+        subject_doc_id = existing_subj[0].id
+    else:
+        _, doc_ref = subj_ref.add({"name": subject, "order": 0})
+        subject_doc_id = doc_ref.id
+
+    # ── Create/find chapters ──
+    chapter_fs_map = {}  # local_chapter_id → firestore_chapter_id
+    for ch in chapters:
+        ch_query = db.collection("chapters").where(
+            "name", "==", ch["name"]
+        ).where(
+            "subjectId", "==", subject_doc_id
+        ).limit(1).get()
+
+        if ch_query:
+            chapter_fs_map[ch["id"]] = ch_query[0].id
+        else:
+            _, ch_ref = db.collection("chapters").add({
+                "name": ch["name"],
+                "subjectId": subject_doc_id,
+                "order": ch.get("chapter_number", 0),
+            })
+            chapter_fs_map[ch["id"]] = ch_ref.id
+
+    # ── Push questions ──
+    await notify(f"Pushing {len(mappings)} questions to Firestore...", 3, 4)
+
+    stats = {"questions": 0, "answers": 0, "images_uploaded": 0, "duplicates_merged": 0, "errors": 0}
+    seen_texts = {}  # normalized_text → firestore_question_id
+
+    for idx, m in enumerate(mappings):
+        q_text = m["question_text"].strip()
+        normalized = q_text.lower().strip()
+
+        # Get Firestore chapter ID
+        final_ch_id = m.get("final_chapter_id", "")
+        fs_chapter_id = chapter_fs_map.get(final_ch_id, "")
+
+        if not fs_chapter_id:
+            # Try from best_match
+            best_match = m.get("best_match")
+            if best_match:
+                if isinstance(best_match, str):
+                    try:
+                        best_match = json.loads(best_match)
+                    except json.JSONDecodeError:
+                        best_match = {}
+                ch_id = best_match.get("chapter_id", "")
+                fs_chapter_id = chapter_fs_map.get(ch_id, "")
+
+        if not fs_chapter_id:
+            stats["errors"] += 1
+            continue
+
+        # Check for duplicate
+        group_id = dup_map.get(m["id"])
+        if group_id and normalized in seen_texts:
+            # Merge exam tag into existing
+            existing_q_id = seen_texts[normalized]
+            exam_tag = m.get("exam_tag", "")
+            if exam_tag:
+                try:
+                    from firebase_admin import firestore as fs_module
+                    db.collection("questions").document(existing_q_id).update({
+                        "exams": fs_module.ArrayUnion([exam_tag])
+                    })
+                except Exception:
+                    pass
+            stats["duplicates_merged"] += 1
+            continue
+
+        # Get page references
+        page_refs = {}
+        best_match = m.get("best_match")
+        if best_match:
+            if isinstance(best_match, str):
+                try:
+                    best_match = json.loads(best_match)
+                except json.JSONDecodeError:
+                    best_match = {}
+            page_refs = best_match.get("page_references", {}) or {}
+
+        exam_tag = m.get("exam_tag", "")
+        q_type = m.get("question_type", "OTHER")
+
+        # Check for existing answer
+        answer_rows = await database.fetch_all("answers", "mapping_id = ?", (m["id"],))
+
+        has_answer = False
+        answer_doc_id = None
+
+        if answer_rows:
+            ans = answer_rows[0]
+            try:
+                bullets = json.loads(ans.get("bullets", "[]")) if ans.get("bullets") else []
+            except json.JSONDecodeError:
+                bullets = []
+
+            # Build answer text from prologue + bullets + epilogue
+            answer_parts = []
+            prologue = ans.get("prologue", "")
+            epilogue = ans.get("epilogue", "")
+            if prologue:
+                answer_parts.append(prologue)
+            for b in bullets:
+                answer_parts.append(f"- {b}")
+            if epilogue:
+                answer_parts.append(epilogue)
+            answer_text = "\n".join(answer_parts)
+
+            # Handle images
+            image_urls = []
+            if upload_images:
+                try:
+                    images_raw = json.loads(ans.get("images", "[]")) if ans.get("images") else []
+                except json.JSONDecodeError:
+                    images_raw = []
+
+                if images_raw:
+                    from qb.imagekit_uploader import upload_answer_images
+                    image_urls = await upload_answer_images(images_raw, subject)
+                    image_urls = [u for u in image_urls if u]  # Filter empty
+                    stats["images_uploaded"] += len(image_urls)
+
+            # Push answer to Firestore
+            answer_payload = {
+                "text": answer_text,
+                "imageUrls": image_urls,
+            }
+
+            # Check for existing answer in Firestore
+            existing_ans = db.collection("answers").where(
+                "text", "==", answer_text[:200]  # Partial match to avoid Firestore limits
+            ).limit(1).get()
+
+            if existing_ans:
+                answer_doc_id = existing_ans[0].id
+                db.collection("answers").document(answer_doc_id).update(answer_payload)
+            else:
+                _, ans_ref = db.collection("answers").add(answer_payload)
+                answer_doc_id = ans_ref.id
+
+            has_answer = True
+            stats["answers"] += 1
+
+        # Push question to Firestore
+        question_payload = {
+            "questionText": q_text,
+            "type": q_type,
+            "chapterId": fs_chapter_id,
+            "exams": [exam_tag] if exam_tag else [],
+            "isAnswered": has_answer,
+            "answerId": answer_doc_id,
+            "pageNumbers": page_refs,
+            "order": idx + 1,
+        }
+
+        try:
+            # Check for existing question
+            existing_q = db.collection("questions").where(
+                "questionText", "==", q_text
+            ).where(
+                "chapterId", "==", fs_chapter_id
+            ).limit(1).get()
+
+            if existing_q:
+                q_doc_id = existing_q[0].id
+                db.collection("questions").document(q_doc_id).update(question_payload)
+            else:
+                _, q_ref = db.collection("questions").add(question_payload)
+                q_doc_id = q_ref.id
+
+            seen_texts[normalized] = q_doc_id
+            stats["questions"] += 1
+
+            # Mark as pushed in local DB
+            await database.update("mappings", m["id"], {"is_reviewed": 1})
+
+        except Exception as e:
+            logger.error(f"Failed to push question {m['id']}: {e}")
+            stats["errors"] += 1
+
+        if (idx + 1) % 20 == 0:
+            await notify(
+                f"Pushed {idx + 1}/{len(mappings)} questions...",
+                3, 4
+            )
+
+    await notify(
+        f"Push complete: {stats['questions']} questions, {stats['answers']} answers, "
+        f"{stats['images_uploaded']} images, {stats['duplicates_merged']} duplicates merged",
+        4, 4
+    )
+
+    return stats
