@@ -46,6 +46,7 @@ class Settings(BaseSettings):
 
     # --- ImageKit ---
     imagekit_public_key: str = "public_smY90of9evV8XSk1nVYxbEbk18M="
+    imagekit_private_key: str = ""  # <-- Added this line to satisfy Pydantic
     imagekit_auth_url: str = "https://imagekit-auth-service.onrender.com/api/imagekit-auth"
     imagekit_url_endpoint: str = "https://ik.imagekit.io/lohithcodes"
     imagekit_upload_folder: str = "/answer_images"
@@ -63,6 +64,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = str(BASE_DIR / ".env")
         env_file_encoding = "utf-8"
+        # Optional: extra = "ignore" allows unmapped .env variables, but explicitly mapping them is better.
 
 
 settings = Settings()

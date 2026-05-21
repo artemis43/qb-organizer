@@ -444,9 +444,25 @@ async def match_questions_to_chapters(
 
         qp = await database.fetch_one("question_papers", q["qp_id"])
         exam_tag = ""
+        paper_name = ""
         if qp:
-            parts = [qp.get("university", ""), qp.get("month", ""), str(qp.get("year", ""))]
-            exam_tag = " ".join(p for p in parts if p and p != "None")
+            # Build paper_name (human-readable: university, month, year)
+            name_parts = []
+            if qp.get("university"):
+                name_parts.append(qp["university"])
+            if qp.get("month"):
+                name_parts.append(qp["month"])
+            if qp.get("year"):
+                name_parts.append(str(qp["year"]))
+            paper_name = ", ".join(p for p in name_parts if p and p != "None")
+
+            # Build exam_tag: try RS-X pattern from QP filename/text (will be
+            # populated on future re-extractions). For existing data, fall back to paper_name.
+            raw_exam_tag = qp.get("exam_tag", "")
+            if raw_exam_tag:
+                exam_tag = raw_exam_tag
+            else:
+                exam_tag = paper_name
 
         # Layer 1: Vector search
         vector_scores = await vector_match(q_text, textbook_subject)
@@ -555,6 +571,7 @@ async def match_questions_to_chapters(
                     "question_type": q_type,
                     "qp_id": q["qp_id"],
                     "exam_tag": exam_tag,
+                    "paper_name": paper_name,
                     "matched_chapters": top_candidates,
                     "best_match": {
                         "chapter_id": llm_chapter_id,
@@ -601,6 +618,7 @@ async def match_questions_to_chapters(
                     "question_type": q_type,
                     "qp_id": q["qp_id"],
                     "exam_tag": exam_tag,
+                    "paper_name": paper_name,
                     "matched_chapters": top_candidates,
                     "best_match": {
                         "chapter_id": best.get("chapter_id", ""),

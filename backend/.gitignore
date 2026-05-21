@@ -8,8 +8,10 @@ data/logs/
 data/textbooks/
 data/question_papers/
 data/*.sqlite
+data/*.db
 *.egg-info/
 dist/
 build/
 .venv/
 venv/
+firebase-service-account.json

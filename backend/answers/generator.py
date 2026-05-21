@@ -19,6 +19,7 @@ from config import settings
 from core import embedder
 from claude.client import get_claude_client
 from state import db as database
+from knowledge.graph_builder import get_concepts_for_question, get_related_chunk_ids
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ ANSWER_SYSTEM = """You are a senior medical professor writing textbook-quality e
 STRICT RULES:
 1. Use ONLY the provided textbook excerpts as your source material. Do NOT add information from outside knowledge.
 2. Every bullet point must be substantive and factual, sourced from the provided text.
-3. If the textbook excerpts do not contain enough information for the requested number of bullets, use as many as the content supports and note "Limited content available in source."
+3. If the textbook excerpts do not contain enough information for the requested number of bullets, simply use as many bullets as the content genuinely supports — do NOT add any disclaimer or note about limited information.
 
 OUTPUT FORMAT — respond with ONLY valid JSON:
 {
@@ -68,22 +69,78 @@ OUTPUT FORMAT — respond with ONLY valid JSON:
 }
 
 BULLET STYLE GUIDE:
-- "detailed": Each bullet should be 1-3 sentences with explanation, mechanism, or clinical correlation.
+- "detailed": Each bullet should be 1-3 sentences with explanation, mechanism, or clinical correlation. Use **bold** for key medical terms within bullets where helpful.
 - "precise": Each bullet should be exactly 1 concise sentence — fact-dense, no elaboration."""
 
 
 # ── Context Retrieval ─────────────────────────────────────────────
 
 async def _retrieve_context(question_text: str, chapter_id: str, subject: str, n_chunks: int = 5) -> list[dict]:
-    """Retrieve relevant textbook chunks for a question from its matched chapter."""
-    results = embedder.search_similar(
+    """Retrieve relevant textbook chunks with GraphRAG enhancement.
+
+    Layer 1: Vector similarity search in the matched chapter (existing behaviour)
+    Layer 2: Knowledge graph lookup — find concepts in the question, get their
+             source chunks from concept_sources (graph-aware retrieval)
+    Merges both layers, deduplicates, returns enriched context.
+    """
+    seen_ids = set()
+    results = []
+
+    # ── Layer 1: Vector search (existing) ──
+    vector_results = embedder.search_similar(
         subject, question_text, n_results=n_chunks,
         filter_chapter_id=chapter_id,
     )
-    if not results:
-        # Fallback: search without chapter filter (broader)
-        results = embedder.search_similar(subject, question_text, n_results=n_chunks)
-    return results
+    if not vector_results:
+        # Fallback: search without chapter filter
+        vector_results = embedder.search_similar(subject, question_text, n_results=n_chunks)
+
+    for r in vector_results:
+        if r["id"] not in seen_ids:
+            seen_ids.add(r["id"])
+            results.append(r)
+
+    # ── Layer 2: GraphRAG — concept-graph retrieval ──
+    try:
+        relevant_concepts = await get_concepts_for_question(question_text, subject, limit=6)
+        if relevant_concepts:
+            concept_ids = [c["id"] for c in relevant_concepts]
+            graph_chunk_ids = await get_related_chunk_ids(concept_ids, subject)
+
+            # Fetch chunks from DB that aren't already in results
+            for chunk_id in graph_chunk_ids[:12]:  # limit graph chunks
+                if chunk_id in seen_ids:
+                    continue
+                chunk_row = await database.fetch_all(
+                    "chunks", "id = ?", (chunk_id,)
+                )
+                if chunk_row:
+                    c = chunk_row[0]
+                    # Build in same format as ChromaDB result
+                    results.append({
+                        "id": c["id"],
+                        "text": c["text"],
+                        "distance": 0.3,   # Treat graph-sourced as moderately relevant
+                        "similarity": 0.7,
+                        "metadata": {
+                            "chapter_id": c.get("chapter_id", ""),
+                            "textbook_id": c.get("textbook_id", ""),
+                            "page_numbers": c.get("page_numbers", "[]"),
+                            "section_heading": c.get("section_heading", ""),
+                            "chunk_index": c.get("chunk_index", 0),
+                            "source": "graph",  # Mark as graph-sourced
+                        },
+                    })
+                    seen_ids.add(chunk_id)
+    except Exception as e:
+        logger.warning(f"GraphRAG retrieval failed (falling back to vector-only): {e}")
+
+    # Sort: vector results first (higher similarity), then graph-sourced
+    results.sort(key=lambda r: r.get("similarity", 0), reverse=True)
+
+    # Return top n_chunks + a few graph-sourced for richer context
+    max_results = n_chunks + 4
+    return results[:max_results]
 
 
 def _extract_pages(chunks: list[dict], textbook_name: str) -> dict:

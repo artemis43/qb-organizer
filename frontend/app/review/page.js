@@ -274,9 +274,19 @@ function ReviewCard({ mapping, index, total, allChapters, onAccept, onReassign, 
       </div>
 
       {/* Question */}
-      <div style={{ marginBottom: 4, display: "flex", gap: 8 }}>
+      <div style={{ marginBottom: 4, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
         <span className="badge badge-info">{mapping.question_type}</span>
-        {mapping.exam_tag && <span className="badge badge-info">{mapping.exam_tag}</span>}
+        {mapping.exam_tag && mapping.exam_tag.split(",").map((tag, i) => (
+          <span key={i} className="badge badge-info" title={mapping.paper_name || mapping.exam_tag}
+            style={{ background: "var(--accent-bg, #1e3a5f)", color: "var(--accent, #60a5fa)", fontWeight: 600 }}>
+            📋 {tag.trim()}
+          </span>
+        ))}
+        {mapping.paper_name && mapping.paper_name !== mapping.exam_tag && (
+          <span style={{ fontSize: 11, color: "var(--text-dim)", fontStyle: "italic" }}>
+            ({mapping.paper_name})
+          </span>
+        )}
       </div>
       <div className="review-question">{mapping.question_text}</div>
 

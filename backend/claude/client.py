@@ -365,6 +365,43 @@ class ClaudeClient:
 
         raise MaxRetriesExceededError(error_msg)
 
+    def _repair_truncated_json(self, text: str) -> dict | None:
+        """Attempt to repair truncated JSON from Claude (hit max_tokens).
+
+        Strategy: find the last complete object in any array, then close
+        all open brackets/braces to produce valid JSON with partial data.
+        """
+        if not text or not text.strip().startswith("{"):
+            return None
+
+        # Try progressively shorter substrings ending at } or ]
+        for end_char in ["},", "}]", "}", "]"]:
+            idx = text.rfind(end_char)
+            if idx == -1:
+                continue
+
+            # Take text up to and including the end character
+            candidate = text[:idx + len(end_char)]
+
+            # Close any remaining open structures
+            open_braces = candidate.count("{") - candidate.count("}")
+            open_brackets = candidate.count("[") - candidate.count("]")
+
+            # Add closing characters
+            candidate = candidate.rstrip(",").rstrip()
+            candidate += "]" * max(0, open_brackets)
+            candidate += "}" * max(0, open_braces)
+
+            try:
+                result = json.loads(candidate)
+                if isinstance(result, dict):
+                    return result
+            except json.JSONDecodeError:
+                continue
+
+        return None
+
+
     async def request_batch(
         self,
         requests: list[dict],
@@ -466,21 +503,40 @@ class ClaudeClient:
                             is_batch=True,
                         )
 
-                        # Try to parse JSON
+                        # Try to parse JSON from Claude's response
                         try:
-                            if "```json" in text:
-                                text = text.split("```json")[1].split("```")[0].strip()
-                            elif "```" in text:
-                                text = text.split("```")[1].split("```")[0].strip()
+                            json_text = text.strip()
+
+                            # Strip markdown code fences if present
+                            if json_text.startswith("```"):
+                                # Remove opening fence (```json or ```)
+                                first_newline = json_text.index("\n")
+                                json_text = json_text[first_newline + 1:]
+                                # Remove closing fence if present
+                                if "```" in json_text:
+                                    json_text = json_text[:json_text.rindex("```")].strip()
+                                else:
+                                    json_text = json_text.strip()  # Truncated — no closing fence
+
                             results[custom_id] = {
                                 "status": "success",
-                                "data": json.loads(text),
+                                "data": json.loads(json_text),
                             }
                         except json.JSONDecodeError:
-                            results[custom_id] = {
-                                "status": "success",
-                                "data": {"text": text},
-                            }
+                            # Attempt to repair truncated JSON
+                            repaired = self._repair_truncated_json(json_text)
+                            if repaired is not None:
+                                logger.warning(f"Batch {custom_id}: repaired truncated JSON")
+                                results[custom_id] = {
+                                    "status": "success",
+                                    "data": repaired,
+                                }
+                            else:
+                                logger.warning(f"Batch {custom_id}: JSON parse failed, storing raw text")
+                                results[custom_id] = {
+                                    "status": "success",
+                                    "data": {"text": text},
+                                }
                     else:
                         results[custom_id] = {
                             "status": "error",

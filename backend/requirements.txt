@@ -36,6 +36,7 @@ rich==13.9.4
 tenacity==9.0.0
 rapidfuzz==3.11.0
 numpy==2.2.1
+imagekitio==3.1.1
 
 # === Firebase (Firestore push) ===
 firebase-admin>=6.0.0

@@ -90,7 +90,13 @@ export default function TextbooksPage() {
                     <span className={`badge badge-${tb.status === "completed" ? "high" : tb.status === "failed" ? "low" : "medium"}`}>
                       {tb.status}
                     </span>
-                    {tb.status === "kb_pending" && <CheckBatchButton textbookId={tb.id} onDone={loadTextbooks} />}
+                    {tb.kg_status && tb.kg_status !== "not_built" && (
+                      <span className={`badge badge-${tb.kg_status === "completed" || tb.kg_status === "completed_with_errors" ? "high" : tb.kg_status === "failed" ? "low" : "medium"}`}
+                        style={{ fontSize: 10 }}>
+                        KG: {tb.kg_status.replace("kg_", "").replace("_", " ")}
+                      </span>
+                    )}
+                    {(tb.status === "kb_pending" || tb.status === "batch_pending") && <CheckBatchButton textbookId={tb.id} onDone={loadTextbooks} />}
                     <button className="btn btn-sm" style={{ background: "var(--danger-bg)", color: "var(--danger)", border: "1px solid rgba(248,113,113,0.3)" }} onClick={(e) => handleDelete(e, tb.id, tb.name)} title="Delete">🗑</button>
                   </div>
                 </div>

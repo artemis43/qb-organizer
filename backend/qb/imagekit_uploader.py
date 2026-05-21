@@ -1,32 +1,53 @@
 # qb-organizer/backend/qb/imagekit_uploader.py
-"""Upload local images to ImageKit CDN.
+"""Upload local images to ImageKit CDN directly via Server SDK.
 
-Uses the same auth service as the admin dashboard:
-  1. Get auth params from the auth service (signature, token, expire)
-  2. Upload image file to ImageKit upload API
-  3. Return the CDN URL
+Bypasses the client-side auth service for faster, rate-limit-free 
+server-to-server uploads. Compatible with imagekitio v5+.
 """
 
 import logging
-import mimetypes
+import asyncio
 from pathlib import Path
-
-import httpx
+from imagekitio import ImageKit
 
 from config import settings
 
 logger = logging.getLogger(__name__)
 
-IMAGEKIT_UPLOAD_URL = "https://upload.imagekit.io/api/v2/files/upload"
+# Initialize ImageKit lazily
+_imagekit_client = None
 
+def get_imagekit_client():
+    global _imagekit_client
+    if _imagekit_client is None:
+        # ImageKit SDK v5+ only requires the private_key for server-side operations
+        priv_key = settings.imagekit_private_key
+        
+        if not priv_key:
+            logger.error("ImageKit credentials missing in config.py / .env")
+            return None
+            
+        _imagekit_client = ImageKit(private_key=priv_key)
+    return _imagekit_client
 
-async def _get_auth_params() -> dict:
-    """Get authentication parameters from the auth service."""
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(settings.imagekit_auth_url)
-        resp.raise_for_status()
-        return resp.json()
+def _upload_sync(file_path: str, filename: str, folder: str, tags: list[str]) -> str:
+    """Synchronous SDK upload function to be run in a thread."""
+    client = get_imagekit_client()
+    if not client:
+        return None
 
+    try:
+        # In ImageKit Python SDK v5.x, upload is handled via client.files.upload
+        result = client.files.upload(
+            file=Path(file_path),
+            file_name=filename,
+            folder=folder,
+            tags=tags
+        )
+        return result.url
+    except Exception as e:
+        logger.error(f"ImageKit SDK upload failed for {filename}: {e}")
+        return None
 
 async def upload_image(
     file_path: str,
@@ -34,55 +55,22 @@ async def upload_image(
     folder: str = None,
     tags: list[str] = None,
 ) -> str | None:
-    """Upload a local image file to ImageKit.
-
-    Returns the ImageKit CDN URL, or None on failure.
-    """
+    """Upload a local image file to ImageKit using asyncio threads."""
     path = Path(file_path)
     if not path.exists():
         logger.warning(f"Image file not found: {file_path}")
         return None
 
     filename = filename or path.name
-    folder = folder or settings.imagekit_upload_folder
+    folder = folder or getattr(settings, "imagekit_upload_folder", "/qb_organizer")
     tags = tags or ["answer_image", "qb_organizer"]
 
-    try:
-        auth = await _get_auth_params()
-        mime_type = mimetypes.guess_type(str(path))[0] or "image/png"
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            with open(path, "rb") as f:
-                files = {"file": (filename, f, mime_type)}
-                data = {
-                    "fileName": filename,
-                    "useUniqueFileName": "true",
-                    "folder": folder,
-                    "publicKey": settings.imagekit_public_key,
-                    "signature": auth["signature"],
-                    "expire": str(auth["expire"]),
-                    "token": auth["token"],
-                    "tags": ",".join(tags),
-                }
-                resp = await client.post(IMAGEKIT_UPLOAD_URL, data=data, files=files)
-                resp.raise_for_status()
-                result = resp.json()
-
-        url = result.get("url")
-        if url:
-            logger.info(f"Uploaded {filename} → {url}")
-            return url
-        else:
-            logger.error(f"ImageKit upload returned no URL: {result}")
-            return None
-
-    except httpx.HTTPStatusError as e:
-        logger.error(f"ImageKit upload failed ({e.response.status_code}): {e.response.text}")
-        return None
-    except Exception as e:
-        logger.error(f"ImageKit upload error for {filename}: {e}")
-        return None
-
+    # Run the synchronous SDK call in a background thread to prevent blocking FastAPI
+    url = await asyncio.to_thread(_upload_sync, str(path), filename, folder, tags)
+    
+    if url:
+        logger.info(f"Uploaded {filename} → {url}")
+    return url
 
 async def upload_answer_images(images: list[dict], subject: str = "") -> list[str]:
     """Upload multiple answer images and return CDN URLs.
@@ -96,12 +84,16 @@ async def upload_answer_images(images: list[dict], subject: str = "") -> list[st
         List of ImageKit CDN URLs (empty strings for failed uploads)
     """
     urls = []
-    folder = f"{settings.imagekit_upload_folder}/{subject}" if subject else settings.imagekit_upload_folder
+    base_folder = getattr(settings, "imagekit_upload_folder", "/qb_organizer")
+    
+    # Sanitize subject name for folder path
+    clean_subject = subject.replace(" ", "_").lower() if subject else "general"
+    folder = f"{base_folder}/{clean_subject}"
 
     for img in images:
         file_path = img.get("path", "")
         if not file_path:
-            # Reconstruct path from filename pattern: {textbook_id}_p{page}_img{idx}.{ext}
+            # Reconstruct path from filename pattern if path is missing
             filename = img.get("filename", "")
             if filename:
                 parts = filename.split("_p")
@@ -118,7 +110,7 @@ async def upload_answer_images(images: list[dict], subject: str = "") -> list[st
             file_path,
             filename=img.get("filename"),
             folder=folder,
-            tags=["answer_image", subject] if subject else None,
+            tags=["answer_image", clean_subject],
         )
         urls.append(url or "")
 

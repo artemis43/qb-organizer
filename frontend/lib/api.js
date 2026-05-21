@@ -375,3 +375,84 @@ export async function vivaPushToFirestore(questionIds) {
 export async function getVivaFirestoreStatus() {
   return fetchAPI("/viva/firestore-status");
 }
+
+// ── Knowledge Graph ──
+export async function kgBuild(textbookId) {
+  const id = textbookId && typeof textbookId === "object" ? textbookId.id : String(textbookId || "");
+  if (!id || id === "[object Object]") throw new Error("Invalid textbook ID: " + JSON.stringify(textbookId));
+  const res = await fetch(`${API_BASE}/knowledge/build/${encodeURIComponent(id)}`, { method: "POST" });
+  return res.json();
+}
+
+export async function kgProcessBatch(textbookId) {
+  const id = textbookId && typeof textbookId === "object" ? textbookId.id : String(textbookId || "");
+  if (!id || id === "[object Object]") throw new Error("Invalid textbook ID: " + JSON.stringify(textbookId));
+  return fetchAPI(`/knowledge/batch/${encodeURIComponent(id)}`, { method: "POST" });
+}
+
+export async function kgExtractRelations(textbookId) {
+  const id = textbookId && typeof textbookId === "object" ? textbookId.id : String(textbookId || "");
+  if (!id || id === "[object Object]") throw new Error("Invalid textbook ID: " + JSON.stringify(textbookId));
+  return fetchAPI(`/knowledge/extract-relations/${encodeURIComponent(id)}`, { method: "POST" });
+}
+
+export async function kgProcessRelations(textbookId) {
+  const id = textbookId && typeof textbookId === "object" ? textbookId.id : String(textbookId || "");
+  if (!id || id === "[object Object]") throw new Error("Invalid textbook ID: " + JSON.stringify(textbookId));
+  return fetchAPI(`/knowledge/process-relations/${encodeURIComponent(id)}`, { method: "POST" });
+}
+
+export async function kgGetStats(subject = null) {
+  const qs = subject ? `?subject=${encodeURIComponent(subject)}` : "";
+  return fetchAPI(`/knowledge/stats${qs}`);
+}
+
+export async function kgSearch(query = "", subject = null, conceptType = null, importance = null, limit = 50) {
+  const params = new URLSearchParams();
+  if (query) params.append("q", query);
+  if (subject) params.append("subject", subject);
+  if (conceptType) params.append("concept_type", conceptType);
+  if (importance) params.append("importance", importance);
+  if (limit) params.append("limit", limit);
+  const qs = params.toString();
+  return fetchAPI(`/knowledge/search${qs ? "?" + qs : ""}`);
+}
+
+export async function kgGetConcept(conceptId) {
+  return fetchAPI(`/knowledge/concepts/${conceptId}`);
+}
+
+export async function kgGetGraph(subject = null, conceptType = null, limit = 150) {
+  const params = new URLSearchParams();
+  if (subject) params.append("subject", subject);
+  if (conceptType) params.append("concept_type", conceptType);
+  if (limit) params.append("limit", limit);
+  const qs = params.toString();
+  return fetchAPI(`/knowledge/graph${qs ? "?" + qs : ""}`);
+}
+
+export async function kgGetNeighbors(conceptId) {
+  return fetchAPI(`/knowledge/neighbors/${conceptId}`);
+}
+
+export async function kgDeleteConcept(conceptId) {
+  return fetchAPI(`/knowledge/concepts/${conceptId}`, { method: "DELETE" });
+}
+
+export async function kgDeleteAll(subject = null) {
+  const qs = subject ? `?subject=${encodeURIComponent(subject)}` : "";
+  return fetchAPI(`/knowledge${qs}`, { method: "DELETE" });
+}
+
+export async function kgAddConcept(data) {
+  return fetchAPI("/knowledge/concepts", { method: "POST", body: JSON.stringify(data) });
+}
+
+export async function kgAddRelation(data) {
+  return fetchAPI("/knowledge/relations", { method: "POST", body: JSON.stringify(data) });
+}
+
+export async function kgGetConceptTypes() {
+  return fetchAPI("/knowledge/concept-types");
+}
+

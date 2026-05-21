@@ -38,11 +38,12 @@ You MUST respond with valid JSON only:
     }
   ],
   "metadata": {
-    "university": "university name or null",
+    "university": "full university name or null",
     "subject": "subject name or null",
     "year": 2024,
     "month": "June",
-    "paper_number": "Paper I"
+    "paper_number": "Paper I",
+    "exam_schemes": ["RS-4"]
   }
 }
 
@@ -61,7 +62,10 @@ Rules:
 - Keep medical terminology EXACTLY as written
 - For multi-part questions (a, b, c), extract each part separately
 - If marks are visible, include them; if not, set to null
-- Detect the type from section headers, marks, or question structure"""
+- Detect the type from section headers, marks, or question structure
+- For exam_schemes: look for patterns like (RS-1), (RS-2), (RS-3), (RS-4) etc. in the paper header.
+  A single paper may have multiple scheme codes. Return all found as an array like ["RS-4"] or ["RS-3", "RS-4"].
+  If none found, return an empty array."""
 
 
 def detect_metadata_from_filename(filename: str) -> dict:
@@ -92,6 +96,24 @@ def detect_metadata_from_filename(filename: str) -> dict:
             break
 
     return meta
+
+
+def detect_exam_schemes_from_text(text: str) -> list[str]:
+    """Extract exam scheme codes (e.g. RS-4, RS-1) from QP text.
+
+    RGUHS papers encode the exam round as a bracketed code like (RS-4).
+    A single paper may have multiple codes if it covers multiple sections.
+
+    Returns a sorted, deduplicated list of scheme codes found, e.g. ['RS-4'].
+    Returns an empty list if none found.
+    """
+    # Match (RS-N) or (RS-NN) anywhere in the text
+    matches = re.findall(r'\(RS-(\d+)\)', text, re.IGNORECASE)
+    if not matches:
+        # Also try without parentheses: "- RS-4" or "RS-4" near subject line
+        matches = re.findall(r'\bRS-(\d+)\b', text, re.IGNORECASE)
+    unique = sorted(set(matches), key=lambda x: int(x))
+    return [f"RS-{n}" for n in unique]
 
 
 async def extract_questions_from_qp(
@@ -188,15 +210,32 @@ async def extract_questions_from_qp(
         if extracted_meta.get("month") and not meta.get("month"):
             meta["month"] = extracted_meta["month"]
 
-        # Build exam tag
-        parts = []
+        # --- Build exam_tag (RS-X codes) and paper_name (human-readable) ---
+        # 1. Try to get RS-X schemes from the PDF text (most reliable)
+        scheme_codes = detect_exam_schemes_from_text(full_text)
+
+        # 2. Also check if Claude extracted any in metadata
+        claude_schemes = extracted_meta.get("exam_schemes", []) or []
+        for s in claude_schemes:
+            s_upper = s.upper()
+            if s_upper not in scheme_codes:
+                scheme_codes.append(s_upper)
+        scheme_codes = sorted(set(scheme_codes), key=lambda x: int(x.split('-')[-1]) if x.split('-')[-1].isdigit() else 0)
+
+        # 3. Build paper_name from university + month + year (descriptive)
+        paper_name_parts = []
         if meta.get("university"):
-            parts.append(meta["university"])
+            paper_name_parts.append(meta["university"])
         if meta.get("month"):
-            parts.append(meta["month"])
+            paper_name_parts.append(meta["month"])
         if meta.get("year"):
-            parts.append(str(meta["year"]))
-        exam_tag = " ".join(parts) if parts else pdf_info.filename
+            paper_name_parts.append(str(meta["year"]))
+        paper_name = ", ".join(paper_name_parts) if paper_name_parts else pdf_info.filename
+
+        # 4. exam_tag = RS codes (comma-sep) if found, else paper_name as fallback
+        exam_tag = ", ".join(scheme_codes) if scheme_codes else paper_name
+
+        logger.info(f"QP {qp_id}: exam_tag='{exam_tag}', paper_name='{paper_name}'")
 
         saved_questions = []
         for q in questions:
@@ -214,6 +253,7 @@ async def extract_questions_from_qp(
             }
             await database.insert("questions", q_data)
             q_data["exam_tag"] = exam_tag
+            q_data["paper_name"] = paper_name
             saved_questions.append(q_data)
 
         # Update QP record
@@ -232,6 +272,7 @@ async def extract_questions_from_qp(
             "filename": pdf_info.filename,
             "subject": subject,
             "exam_tag": exam_tag,
+            "paper_name": paper_name,
             "metadata": meta,
             "questions": saved_questions,
             "total": len(saved_questions),

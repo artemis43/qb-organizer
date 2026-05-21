@@ -277,41 +277,60 @@ async def ingest_textbook(
 
         if batch_requests:
             client = get_claude_client()
-            batch_id = await client.request_batch(
+
+            # ── Submit KB Summary Batch ──
+            kb_batch_id = await client.request_batch(
                 requests=batch_requests,
                 model=settings.haiku_model,
                 task_type="kb_summary",
                 subject=subject,
             )
+            checkpoint.set_meta("kb_batch_id", kb_batch_id)
+            await notify("knowledge", len(batch_requests), len(batch_requests),
+                         f"KB batch submitted: {kb_batch_id} ({len(batch_requests)} chapters)")
 
-            checkpoint.set_meta("kb_batch_id", batch_id)
+            # ── Step 5: Submit KG Extraction Batch (automatic) ──
+            kg_batch_id = None
+            try:
+                from knowledge.graph_builder import _build_kg_batch_requests, CONCEPT_EXTRACTION_SYSTEM
+                kg_requests = await _build_kg_batch_requests(textbook_id, name, subject, all_chapter_ids)
+                if kg_requests:
+                    kg_batch_id = await client.request_batch(
+                        requests=kg_requests,
+                        model=settings.haiku_model,
+                        task_type="kg_extraction",
+                        subject=subject,
+                    )
+                    checkpoint.set_meta("kg_batch_id", kg_batch_id)
+                    await notify("knowledge", len(batch_requests), len(batch_requests),
+                                 f"KG batch submitted: {kg_batch_id} ({len(kg_requests)} chapters)")
+            except Exception as kg_err:
+                logger.warning(f"KG batch submission failed (KB still processing): {kg_err}")
 
             await database.update("textbooks", textbook_id, {
-                "status": "kb_pending",
+                "status": "batch_pending",
+                "kg_status": "kg_batch_pending" if kg_batch_id else "not_built",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             })
 
-            await notify("knowledge", len(batch_requests), len(batch_requests),
-                         f"Batch submitted: {batch_id} ({len(batch_requests)} chapters). "
-                         f"Local processing done in {time_str}.")
-
             return {
                 "textbook_id": textbook_id,
-                "status": "kb_pending",
-                "batch_id": batch_id,
+                "status": "batch_pending",
+                "kb_batch_id": kb_batch_id,
+                "kg_batch_id": kg_batch_id,
                 "chapters": len(all_chapter_ids),
                 "chunks": total_chunks,
                 "processing_time": time_str,
                 "message": (
                     f"Local processing complete ({time_str}). "
                     f"{len(all_chapter_ids)} chapters, {total_chunks} chunks embedded. "
-                    f"KB batch submitted ({len(batch_requests)} chapters) — "
-                    f"click 'Check Batch' when ready."
+                    f"KB + KG batches submitted — click 'Check Batch' when ready."
                 ),
             }
         else:
             await database.update("textbooks", textbook_id, {
                 "status": "completed",
+                "kg_status": "not_built",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             })
 
@@ -332,7 +351,7 @@ async def ingest_textbook(
 
 
 async def process_kb_batch_results(textbook_id: str, batch_id: str) -> dict:
-    """Process the results of a KB batch job."""
+    """Process the results of a KB batch job. Also processes KG batch if present."""
     client = get_claude_client()
     batch_result = await client.poll_batch(batch_id)
 
@@ -364,15 +383,50 @@ async def process_kb_batch_results(textbook_id: str, batch_id: str) -> dict:
             error_count += 1
             logger.error(f"KB generation failed for {chapter_id}: {result.get('error')}")
 
-    status = "completed" if error_count == 0 else "needs_review"
+    kb_status = "completed" if error_count == 0 else "needs_review"
+
+    # ── Also process KG batch if available ──
+    kg_result = None
+    from state.checkpoint import Checkpoint
+    checkpoint = Checkpoint("ingest_textbook", f"{textbook_id}")
+    # Try the ingestion checkpoint first (new integrated flow)
+    kg_batch_id = checkpoint.get_meta("kg_batch_id")
+
+    if not kg_batch_id:
+        # Fallback: try the standalone KG checkpoint (old separate flow)
+        # Load by textbook subject + id pattern
+        textbook = await database.fetch_one("textbooks", textbook_id)
+        if textbook:
+            cp2 = Checkpoint("ingest_textbook", f"{textbook['subject']}_{textbook_id}")
+            kg_batch_id = cp2.get_meta("kg_batch_id")
+        if not kg_batch_id:
+            cp3 = Checkpoint("build_kg", textbook_id)
+            kg_batch_id = cp3.get_meta("kg_batch_id")
+
+    if kg_batch_id:
+        try:
+            from knowledge.graph_builder import process_kg_batch_results
+            kg_result = await process_kg_batch_results(textbook_id, kg_batch_id)
+            logger.info(f"KG batch processed: {kg_result.get('message', '')}")
+        except Exception as e:
+            logger.warning(f"KG batch processing failed (KB still OK): {e}")
+            kg_result = {"status": "failed", "message": str(e)}
+
+    final_status = kb_status
     await database.update("textbooks", textbook_id, {
-        "status": status,
+        "status": final_status,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     })
 
+    message = f"KB complete: {success_count} chapters succeeded, {error_count} failed."
+    if kg_result:
+        message += f" KG: {kg_result.get('message', 'processed')}"
+
     return {
-        "status": status,
+        "status": final_status,
         "succeeded": success_count,
         "failed": error_count,
-        "message": f"KB complete: {success_count} chapters succeeded, {error_count} failed.",
+        "kg_result": kg_result,
+        "message": message,
     }
+

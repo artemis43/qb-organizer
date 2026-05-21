@@ -22,6 +22,12 @@ from config import settings
 from state import db as database
 from claude.client import get_claude_client, ClaudeError
 from knowledge.builder import ingest_textbook, process_kb_batch_results
+from knowledge.graph_builder import (
+    build_knowledge_graph, process_kg_batch_results,
+    extract_relations_for_textbook, process_relations_batch_results,
+    get_graph_stats, search_concepts, get_concept_with_relations,
+    get_graph_for_subject, get_concepts_for_question, VALID_CONCEPT_TYPES,
+)
 from extraction.question_extractor import extract_questions_from_qp, batch_extract_qps
 from matching.matcher import match_questions_to_chapters
 from export.json_exporter import export_subject
@@ -226,24 +232,28 @@ async def get_textbook(textbook_id: str):
 
 @app.post("/api/textbooks/{textbook_id}/check-batch")
 async def check_textbook_batch(textbook_id: str):
-    """Check and process KB batch results."""
+    """Check and process KB + KG batch results for a textbook."""
     from state.checkpoint import Checkpoint
     textbook = await database.fetch_one("textbooks", textbook_id)
     if not textbook:
         raise HTTPException(404, "Textbook not found")
 
-    # Find the batch ID from checkpoints
-    import glob
-    cp_files = list(settings.checkpoints_dir.glob(f"ingest_textbook_*_{textbook_id}*.json"))
-    if not cp_files:
-        raise HTTPException(404, "No checkpoint found for this textbook")
+    # Find the KB batch ID from checkpoint
+    # Try the standard naming pattern: ingest_textbook_{subject}_{id}
+    subject = textbook["subject"]
+    checkpoint = Checkpoint("ingest_textbook", f"{subject}_{textbook_id}")
+    batch_id = checkpoint.get_meta("kb_batch_id")
 
-    with open(cp_files[0], "r") as f:
-        cp_data = json.load(f)
-
-    batch_id = cp_data.get("metadata", {}).get("kb_batch_id")
     if not batch_id:
-        raise HTTPException(404, "No batch ID found")
+        # Fallback: search checkpoint files by glob
+        cp_files = list(settings.checkpoints_dir.glob(f"ingest_textbook_*_{textbook_id}*.json"))
+        if cp_files:
+            with open(cp_files[0], "r") as f:
+                cp_data = json.load(f)
+            batch_id = cp_data.get("metadata", {}).get("kb_batch_id")
+
+    if not batch_id:
+        raise HTTPException(404, "No batch ID found. The textbook may not have been processed yet.")
 
     result = await process_kb_batch_results(textbook_id, batch_id)
     return result
@@ -1403,6 +1413,307 @@ async def api_viva_push(
 async def api_viva_firestore_status():
     """Check Firestore connection status."""
     return check_firestore_connection()
+
+
+# ── Knowledge Graph ─────────────────────────────────────────────
+
+@app.post("/api/knowledge/build/{textbook_id}")
+async def api_kg_build(
+    textbook_id: str,
+    background_tasks: BackgroundTasks,
+):
+    """Build the knowledge graph for a textbook (submits Claude batch)."""
+    textbook = await database.fetch_one("textbooks", textbook_id)
+    if not textbook:
+        raise HTTPException(404, "Textbook not found")
+
+    task_id = f"kg_{uuid.uuid4().hex[:8]}"
+
+    async def process():
+        await asyncio.sleep(0.5)
+        try:
+            async def progress_cb(step, current, total, message):
+                await send_progress(task_id, step, current, total, message)
+
+            result = await build_knowledge_graph(
+                textbook_id=textbook_id,
+                progress_callback=progress_cb,
+            )
+            await send_progress(task_id, "done", 1, 1, json.dumps(result))
+        except Exception as e:
+            logger.exception("Knowledge graph build failed")
+            await send_progress(task_id, "error", 0, 0, str(e))
+
+    background_tasks.add_task(process)
+    return {"task_id": task_id, "message": "Knowledge graph build started."}
+
+
+@app.post("/api/knowledge/batch/{textbook_id}")
+async def api_kg_process_batch(textbook_id: str):
+    """Process Claude batch results for knowledge graph extraction."""
+    textbook = await database.fetch_one("textbooks", textbook_id)
+    if not textbook:
+        raise HTTPException(404, "Textbook not found")
+
+    # Load batch ID from checkpoint — try multiple locations
+    from state.checkpoint import Checkpoint
+
+    batch_id = None
+    # 1. Standalone KG checkpoint
+    cp1 = Checkpoint("build_kg", textbook_id)
+    batch_id = cp1.get_meta("kg_batch_id")
+
+    if not batch_id:
+        # 2. Integrated ingestion checkpoint
+        cp2 = Checkpoint("ingest_textbook", f"{textbook['subject']}_{textbook_id}")
+        batch_id = cp2.get_meta("kg_batch_id")
+
+    if not batch_id:
+        raise HTTPException(404, "No KG batch ID found. The KG batch may not have been submitted for this textbook.")
+
+    result = await process_kg_batch_results(textbook_id, batch_id)
+    return result
+
+
+
+@app.post("/api/knowledge/extract-relations/{textbook_id}")
+async def api_kg_extract_relations(textbook_id: str):
+    """Submit a batch to extract relations between existing concepts."""
+    textbook = await database.fetch_one("textbooks", textbook_id)
+    if not textbook:
+        raise HTTPException(404, "Textbook not found")
+
+    result = await extract_relations_for_textbook(textbook_id)
+    return result
+
+
+@app.post("/api/knowledge/process-relations/{textbook_id}")
+async def api_kg_process_relations(textbook_id: str):
+    """Process Claude batch results for relations extraction."""
+    textbook = await database.fetch_one("textbooks", textbook_id)
+    if not textbook:
+        raise HTTPException(404, "Textbook not found")
+
+    from state.checkpoint import Checkpoint
+    batch_id = None
+
+    cp = Checkpoint("extract_relations", textbook_id)
+    batch_id = cp.get_meta("relations_batch_id")
+
+    if not batch_id:
+        raise HTTPException(404, "No relations batch ID found.")
+
+    result = await process_relations_batch_results(textbook_id, batch_id)
+    return result
+
+
+@app.get("/api/knowledge/stats")
+async def api_kg_stats(subject: str = None):
+    """Get knowledge graph statistics, optionally filtered by subject."""
+    stats = await get_graph_stats(subject)
+
+    # Attach per-textbook KG status
+    textbooks = await database.fetch_all("textbooks")
+    kg_statuses = [
+        {
+            "id": tb["id"],
+            "name": tb["name"],
+            "subject": tb["subject"],
+            "kg_status": tb.get("kg_status", "not_built"),
+        }
+        for tb in textbooks
+        if not subject or tb["subject"] == subject
+    ]
+
+    return {**stats, "textbooks": kg_statuses}
+
+
+@app.get("/api/knowledge/search")
+async def api_kg_search(
+    q: str = "",
+    subject: str = None,
+    concept_type: str = None,
+    importance: str = None,
+    limit: int = 50,
+):
+    """Search the knowledge graph for concepts."""
+    concepts = await search_concepts(
+        query=q,
+        subject=subject,
+        concept_type=concept_type,
+        importance=importance,
+        limit=min(limit, 200),
+    )
+    return {"concepts": concepts, "count": len(concepts)}
+
+
+@app.get("/api/knowledge/concepts/{concept_id}")
+async def api_kg_get_concept(concept_id: str):
+    """Get a concept with all its relations and sources."""
+    concept = await get_concept_with_relations(concept_id)
+    if not concept:
+        raise HTTPException(404, "Concept not found")
+    return concept
+
+
+@app.get("/api/knowledge/graph")
+async def api_kg_graph(
+    subject: str = None,
+    concept_type: str = None,
+    limit: int = 150,
+):
+    """Get graph data (nodes + edges) for visualization."""
+    if not subject:
+        # Default to first subject that has concepts
+        subjects = await database.fetch_all("textbooks")
+        subject_names = list({tb["subject"] for tb in subjects})
+        if not subject_names:
+            return {"nodes": [], "edges": [], "total_nodes": 0, "total_edges": 0}
+        subject = subject_names[0]
+
+    graph = await get_graph_for_subject(
+        subject=subject,
+        concept_type=concept_type,
+        limit=min(limit, 300),
+    )
+    return graph
+
+
+@app.get("/api/knowledge/neighbors/{concept_id}")
+async def api_kg_neighbors(concept_id: str, depth: int = 1):
+    """Get a concept and its immediate neighbors in the graph."""
+    concept = await get_concept_with_relations(concept_id)
+    if not concept:
+        raise HTTPException(404, "Concept not found")
+
+    # Collect neighbor IDs
+    neighbor_ids = set()
+    for rel in concept.get("outgoing_relations", []):
+        neighbor_ids.add(rel["target_id"])
+    for rel in concept.get("incoming_relations", []):
+        neighbor_ids.add(rel["source_id"])
+
+    # Build subgraph
+    nodes = [{"id": concept["id"], "name": concept["name"],
+               "concept_type": concept["concept_type"],
+               "importance": concept["importance"],
+               "frequency": concept["frequency"], "is_center": True}]
+
+    edges = []
+    for rel in concept.get("outgoing_relations", []):
+        neighbor = await database.fetch_one("concepts", rel["target_id"])
+        if neighbor:
+            nodes.append({"id": neighbor["id"], "name": neighbor["name"],
+                          "concept_type": neighbor["concept_type"],
+                          "importance": neighbor["importance"],
+                          "frequency": neighbor["frequency"], "is_center": False})
+            edges.append({"source": concept["id"], "target": rel["target_id"],
+                          "relation_type": rel["relation_type"], "confidence": rel["confidence"]})
+
+    for rel in concept.get("incoming_relations", []):
+        neighbor = await database.fetch_one("concepts", rel["source_id"])
+        if neighbor and not any(n["id"] == neighbor["id"] for n in nodes):
+            nodes.append({"id": neighbor["id"], "name": neighbor["name"],
+                          "concept_type": neighbor["concept_type"],
+                          "importance": neighbor["importance"],
+                          "frequency": neighbor["frequency"], "is_center": False})
+        if neighbor:
+            edges.append({"source": rel["source_id"], "target": concept["id"],
+                          "relation_type": rel["relation_type"], "confidence": rel["confidence"]})
+
+    return {"center": concept, "nodes": nodes, "edges": edges}
+
+
+@app.get("/api/knowledge/for-question")
+async def api_kg_for_question(question: str, subject: str):
+    """Find concepts relevant to a question (for GraphRAG context)."""
+    concepts = await get_concepts_for_question(question, subject)
+    return {"concepts": concepts, "count": len(concepts)}
+
+
+@app.delete("/api/knowledge/concepts/{concept_id}")
+async def api_kg_delete_concept(concept_id: str):
+    """Delete a concept and its relations/sources."""
+    await database.execute("DELETE FROM concept_sources WHERE concept_id = ?", (concept_id,))
+    await database.execute(
+        "DELETE FROM concept_relations WHERE source_id = ? OR target_id = ?",
+        (concept_id, concept_id)
+    )
+    await database.execute("DELETE FROM concepts WHERE id = ?", (concept_id,))
+    return {"status": "ok", "message": "Concept deleted"}
+
+
+@app.delete("/api/knowledge")
+async def api_kg_delete_all(subject: str = None):
+    """Delete all knowledge graph data for a subject (or all)."""
+    if subject:
+        # Get concept IDs for this subject
+        concepts = await database.fetch_all("concepts", "subject = ?", (subject,))
+        for c in concepts:
+            await database.execute("DELETE FROM concept_sources WHERE concept_id = ?", (c["id"],))
+            await database.execute(
+                "DELETE FROM concept_relations WHERE source_id = ? OR target_id = ?",
+                (c["id"], c["id"])
+            )
+        await database.execute("DELETE FROM concepts WHERE subject = ?", (subject,))
+        # Reset KG status for textbooks in this subject
+        await database.execute(
+            "UPDATE textbooks SET kg_status = 'not_built' WHERE subject = ?", (subject,)
+        )
+    else:
+        await database.execute("DELETE FROM concept_sources", ())
+        await database.execute("DELETE FROM concept_relations", ())
+        await database.execute("DELETE FROM concepts", ())
+        await database.execute("UPDATE textbooks SET kg_status = 'not_built'", ())
+
+    return {"status": "ok", "message": "Knowledge graph data deleted"}
+
+
+@app.post("/api/knowledge/concepts")
+async def api_kg_add_concept(data: dict):
+    """Manually add a concept to the knowledge graph."""
+    required = ["name", "concept_type", "subject"]
+    for field in required:
+        if not data.get(field):
+            raise HTTPException(400, f"Missing required field: {field}")
+
+    from knowledge.graph_builder import _find_or_create_concept
+    concept_id, is_new = await _find_or_create_concept(
+        name=data["name"],
+        concept_type=data.get("concept_type", "other"),
+        definition=data.get("definition", ""),
+        aliases=data.get("aliases", []),
+        importance=data.get("importance", "standard"),
+        subject=data["subject"],
+    )
+    return {"id": concept_id, "is_new": is_new, "message": "Concept added" if is_new else "Concept merged"}
+
+
+@app.post("/api/knowledge/relations")
+async def api_kg_add_relation(data: dict):
+    """Manually add a relation between two concepts."""
+    required = ["source_id", "target_id", "relation_type"]
+    for field in required:
+        if not data.get(field):
+            raise HTTPException(400, f"Missing required field: {field}")
+
+    from knowledge.graph_builder import _upsert_relation
+    added = await _upsert_relation(
+        source_id=data["source_id"],
+        target_id=data["target_id"],
+        relation_type=data["relation_type"],
+        confidence=float(data.get("confidence", 0.9)),
+        extracted_by="manual",
+    )
+    if not added:
+        return {"status": "exists", "message": "Relation already exists or invalid"}
+    return {"status": "ok", "message": "Relation added"}
+
+
+@app.get("/api/knowledge/concept-types")
+async def api_kg_concept_types():
+    """Return valid concept types."""
+    return {"types": sorted(VALID_CONCEPT_TYPES)}
 
 
 # ── Run ───────────────────────────────────────────────────────────

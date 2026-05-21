@@ -34,6 +34,7 @@ function Sidebar() {
     { href: "/review", icon: "🔍", label: "Review Center" },
     { href: "/answers", icon: "✍️", label: "Answers" },
     { href: "/viva", icon: "🎤", label: "Viva Organizer" },
+    { href: "/knowledge", icon: "🕸️", label: "Knowledge Graph" },
     { href: "/export", icon: "🚀", label: "Deploy" },
     { href: "/settings", icon: "⚙️", label: "Settings" },
   ];

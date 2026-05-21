@@ -12,6 +12,7 @@ are stored in Firestore — exactly as the admin dashboard does it.
 
 import json
 import logging
+import re
 from pathlib import Path
 
 from config import settings
@@ -19,6 +20,77 @@ from state import db as database
 from matching.matcher import find_duplicate_questions
 
 logger = logging.getLogger(__name__)
+
+# ── Answer text cleanup & formatting ─────────────────────────────
+
+# Phrases that indicate the source had limited information.
+# These should never appear in the final answer shown to students.
+_LIMITED_INFO_PATTERNS = [
+    r"Limited(?:\s+(?:source|textbook))?\s+(?:information|content|data|detail|material)\s+(?:is\s+)?available[^.]*\.",
+    r"(?:The\s+)?(?:source|textbook|provided)\s+(?:material|text|content|excerpts?)?\s+(?:is|are|does\s+not|doesn'?t)\s+(?:insufficient|not\s+enough|limited)[^.]*\.",
+    r"(?:Not|No)\s+enough\s+(?:information|content|detail)[^.]*(?:source|textbook|text)[^.]*\.",
+    r"Based\s+on\s+(?:the\s+)?(?:available|limited|provided)\s+(?:source|textbook|content|text)[^.]*(?:cannot|unable\s+to|difficult\s+to)[^.]*\.",
+    r"The\s+(?:source|textbook)\s+(?:does\s+not|doesn'?t)\s+(?:provide|contain|include|cover)[^.]*(?:details?|information|content)[^.]*\.",
+    r"(?:Source|Textbook|Content)\s+(?:is|provides?)?\s+(?:insufficient|limited|incomplete)[^.]*\.",
+    r"(?:Further|Additional|More)\s+(?:information|details?)\s+(?:not|is\s+not)\s+(?:available|provided)[^.]*\.",
+    r"This\s+(?:topic|question)\s+(?:is\s+)?(?:not|poorly)\s+(?:covered|discussed|addressed)[^.]*(?:source|textbook)[^.]*\.",
+]
+
+
+def _clean_answer_text(text: str) -> str:
+    """Strip 'limited source info' disclaimers from generated answer text."""
+    if not text:
+        return text
+    for pattern in _LIMITED_INFO_PATTERNS:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
+    # Collapse 2+ consecutive blank lines into one
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+def _format_answer_markdown(prologue: str, bullets: list, epilogue: str) -> str:
+    """Assemble answer sections into clean, readable markdown.
+
+    Structure:
+        {prologue paragraph}
+
+        - **Term:** detail
+        - Point
+
+        *{epilogue}*
+    """
+    parts = []
+
+    if prologue:
+        cleaned_prologue = _clean_answer_text(prologue.strip())
+        if cleaned_prologue:
+            parts.append(cleaned_prologue)
+
+    if bullets:
+        bullet_lines = []
+        for b in bullets:
+            b = b.strip()
+            if not b:
+                continue
+            b = _clean_answer_text(b)
+            if not b:
+                continue
+            # If the bullet already starts with '-' or '*', keep it; otherwise prefix
+            if b.startswith(('-', '*', '•')):
+                line = b
+            else:
+                line = f"- {b}"
+            bullet_lines.append(line)
+        if bullet_lines:
+            parts.append("\n".join(bullet_lines))
+
+    if epilogue:
+        cleaned_epilogue = _clean_answer_text(epilogue.strip())
+        if cleaned_epilogue:
+            # Wrap epilogue in italics as a summary/conclusion note
+            parts.append(f"*{cleaned_epilogue}*")
+
+    return "\n\n".join(parts)
 
 # Lazy-loaded Firestore client (reuses viva module's init)
 _firestore_client = None
@@ -183,14 +255,15 @@ async def push_qb_to_firestore(
         # Check for duplicate
         group_id = dup_map.get(m["id"])
         if group_id and normalized in seen_texts:
-            # Merge exam tag into existing
+            # Merge exam tags into existing
             existing_q_id = seen_texts[normalized]
-            exam_tag = m.get("exam_tag", "")
-            if exam_tag:
+            raw_tag = m.get("exam_tag", "")
+            merge_tags = [t.strip() for t in raw_tag.split(",") if t.strip()] if raw_tag else []
+            if merge_tags:
                 try:
                     from firebase_admin import firestore as fs_module
                     db.collection("questions").document(existing_q_id).update({
-                        "exams": fs_module.ArrayUnion([exam_tag])
+                        "exams": fs_module.ArrayUnion(merge_tags)
                     })
                 except Exception:
                     pass
@@ -208,7 +281,10 @@ async def push_qb_to_firestore(
                     best_match = {}
             page_refs = best_match.get("page_references", {}) or {}
 
-        exam_tag = m.get("exam_tag", "")
+        # Parse exam tags (may be comma-separated: "RS-3, RS-4")
+        raw_exam_tag = m.get("exam_tag", "")
+        exam_tags = [t.strip() for t in raw_exam_tag.split(",") if t.strip()] if raw_exam_tag else []
+        paper_name = m.get("paper_name", "") or raw_exam_tag
         q_type = m.get("question_type", "OTHER")
 
         # Check for existing answer
@@ -224,17 +300,12 @@ async def push_qb_to_firestore(
             except json.JSONDecodeError:
                 bullets = []
 
-            # Build answer text from prologue + bullets + epilogue
-            answer_parts = []
-            prologue = ans.get("prologue", "")
-            epilogue = ans.get("epilogue", "")
-            if prologue:
-                answer_parts.append(prologue)
-            for b in bullets:
-                answer_parts.append(f"- {b}")
-            if epilogue:
-                answer_parts.append(epilogue)
-            answer_text = "\n".join(answer_parts)
+            # Build answer text as rich markdown
+            answer_text = _format_answer_markdown(
+                prologue=ans.get("prologue", ""),
+                bullets=bullets,
+                epilogue=ans.get("epilogue", ""),
+            )
 
             # Handle images
             image_urls = []
@@ -276,7 +347,8 @@ async def push_qb_to_firestore(
             "questionText": q_text,
             "type": q_type,
             "chapterId": fs_chapter_id,
-            "exams": [exam_tag] if exam_tag else [],
+            "exams": exam_tags,
+            "paperName": paper_name,
             "isAnswered": has_answer,
             "answerId": answer_doc_id,
             "pageNumbers": page_refs,

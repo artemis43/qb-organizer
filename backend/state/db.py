@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS textbooks (
     total_images INTEGER DEFAULT 0,
     file_size_mb REAL DEFAULT 0,
     status TEXT DEFAULT 'pending',
+    kg_status TEXT DEFAULT 'not_built',
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))
 );
@@ -104,6 +105,7 @@ CREATE TABLE IF NOT EXISTS mappings (
     question_type TEXT,
     qp_id TEXT NOT NULL,
     exam_tag TEXT,
+    paper_name TEXT,
     matched_chapters TEXT, -- JSON array of ChapterMatch
     best_match TEXT,       -- JSON object
     confidence REAL DEFAULT 0,
@@ -199,14 +201,55 @@ CREATE TABLE IF NOT EXISTS viva_questions (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
--- Processing Logs
-CREATE TABLE IF NOT EXISTS processing_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT DEFAULT (datetime('now')),
-    level TEXT DEFAULT 'info',
-    task TEXT,
-    message TEXT,
-    details TEXT   -- JSON
+
+
+-- ── Knowledge Graph Tables ─────────────────────────────────────
+
+-- Medical Concepts (nodes in the knowledge graph)
+CREATE TABLE IF NOT EXISTS concepts (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    canonical_name TEXT NOT NULL,        -- lowercased, normalized for dedup
+    concept_type TEXT NOT NULL,          -- disease, anatomy, procedure, drug, symptom, investigation, pathology, physiology, other
+    umls_cui TEXT,                       -- UMLS Concept ID if available
+    definition TEXT,                     -- brief definition from textbook(s)
+    aliases TEXT,                        -- JSON array of alternate names/abbreviations
+    subject TEXT NOT NULL,               -- e.g. "General Surgery"
+    importance TEXT DEFAULT 'standard',  -- must_know, standard, advanced
+    frequency INTEGER DEFAULT 1,         -- how many times seen across all sources
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+-- Relationships between concepts (edges in the graph)
+CREATE TABLE IF NOT EXISTS concept_relations (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    relation_type TEXT NOT NULL,         -- is_subtype_of, causes, presents_with, treated_by,
+                                         -- investigated_by, complication_of, associated_with,
+                                         -- part_of, differential_of, risk_factor_for
+    confidence REAL DEFAULT 0.8,
+    extracted_by TEXT DEFAULT 'claude',  -- scispacy | claude | manual
+    metadata TEXT,                       -- JSON: extra context
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (source_id) REFERENCES concepts(id),
+    FOREIGN KEY (target_id) REFERENCES concepts(id)
+);
+
+-- Provenance: which textbook+chapter+chunk mentions each concept
+CREATE TABLE IF NOT EXISTS concept_sources (
+    id TEXT PRIMARY KEY,
+    concept_id TEXT NOT NULL,
+    textbook_id TEXT NOT NULL,
+    chapter_id TEXT,
+    chunk_ids TEXT,                      -- JSON array of chunk IDs
+    page_numbers TEXT,                   -- JSON array of page numbers
+    extracted_text TEXT,                 -- relevant text snippet
+    extraction_method TEXT DEFAULT 'claude',
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (concept_id) REFERENCES concepts(id),
+    FOREIGN KEY (textbook_id) REFERENCES textbooks(id)
 );
 
 -- Indexes
@@ -219,6 +262,14 @@ CREATE INDEX IF NOT EXISTS idx_retry_status ON retry_queue(status);
 CREATE INDEX IF NOT EXISTS idx_answers_mapping ON answers(mapping_id);
 CREATE INDEX IF NOT EXISTS idx_viva_subject ON viva_questions(subject);
 CREATE INDEX IF NOT EXISTS idx_viva_status ON viva_questions(status);
+CREATE INDEX IF NOT EXISTS idx_concepts_canonical ON concepts(canonical_name);
+CREATE INDEX IF NOT EXISTS idx_concepts_type ON concepts(concept_type);
+CREATE INDEX IF NOT EXISTS idx_concepts_subject ON concepts(subject);
+CREATE INDEX IF NOT EXISTS idx_relations_source ON concept_relations(source_id);
+CREATE INDEX IF NOT EXISTS idx_relations_target ON concept_relations(target_id);
+CREATE INDEX IF NOT EXISTS idx_relations_type ON concept_relations(relation_type);
+CREATE INDEX IF NOT EXISTS idx_sources_concept ON concept_sources(concept_id);
+CREATE INDEX IF NOT EXISTS idx_sources_textbook ON concept_sources(textbook_id);
 """
 
 
@@ -238,6 +289,26 @@ async def init_db():
                 logger.info("Migration: added 'images' column to answers table")
             except Exception:
                 pass  # Column might already exist
+
+        try:
+            await db.execute("SELECT paper_name FROM mappings LIMIT 1")
+        except Exception:
+            try:
+                await db.execute("ALTER TABLE mappings ADD COLUMN paper_name TEXT")
+                await db.commit()
+                logger.info("Migration: added 'paper_name' column to mappings table")
+            except Exception:
+                pass  # Column might already exist
+
+        # Legacy migration: add kg_status if missing (for existing DBs before schema update)
+        try:
+            await db.execute("SELECT kg_status FROM textbooks LIMIT 1")
+        except Exception:
+            try:
+                await db.execute("ALTER TABLE textbooks ADD COLUMN kg_status TEXT DEFAULT 'not_built'")
+                await db.commit()
+            except Exception:
+                pass  # Already exists
 
     logger.info(f"Database initialized at {DB_PATH}")
 
