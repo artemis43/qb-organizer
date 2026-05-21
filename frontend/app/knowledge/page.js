@@ -1,5 +1,6 @@
 "use client";
 import { useState, useEffect, useRef, useCallback } from "react";
+import dynamic from "next/dynamic";
 import {
   getSubjects, getTextbooks,
   kgProcessBatch, kgGetStats, kgSearch,
@@ -7,6 +8,22 @@ import {
   kgDeleteConcept, kgDeleteAll, kgAddConcept, kgAddRelation,
   kgGetConceptTypes, kgExtractRelations, kgProcessRelations,
 } from "@/lib/api";
+
+const Graph3D = dynamic(() => import("./Graph3D"), {
+  ssr: false,
+  loading: () => (
+    <div style={{
+      width: "100%", height: 520, borderRadius: 14,
+      background: "radial-gradient(circle at center, #0f0f2d 0%, #060614 100%)",
+      border: "1px solid rgba(60,60,100,0.3)",
+      display: "flex", alignItems: "center", justifyContent: "center",
+      flexDirection: "column", gap: 14,
+    }}>
+      <div className="spinner" style={{ borderLeftColor: "#818cf8" }} />
+      <div style={{ color: "#818cf8", fontSize: 13, fontWeight: 500 }}>Initializing 3D Mesh Engine...</div>
+    </div>
+  )
+});
 // ── Constants ────────────────────────────────────────────────────
 
 const TYPE_COLORS = {
@@ -61,7 +78,7 @@ function getTypeStyle(type) {
 
 // ── Canvas Graph Renderer (Premium) ───────────────────────────────
 
-function GraphCanvas({ nodes, edges, onSelectNode, selectedNodeId }) {
+function GraphCanvas({ nodes, edges, onSelectNode, selectedNodeId, height = 520 }) {
   const canvasRef = useRef(null);
   const posRef = useRef({});
   const dragRef = useRef(null);
@@ -382,7 +399,7 @@ function GraphCanvas({ nodes, edges, onSelectNode, selectedNodeId }) {
   if (!nodes?.length) {
     return (
       <div style={{
-        width: "100%", height: 520, borderRadius: 14,
+        width: "100%", height: height, borderRadius: 14,
         background: "linear-gradient(180deg, #0d0d1f 0%, #080814 100%)",
         border: "1px solid rgba(60,60,100,0.3)",
         display: "flex", alignItems: "center", justifyContent: "center",
@@ -396,7 +413,7 @@ function GraphCanvas({ nodes, edges, onSelectNode, selectedNodeId }) {
   }
 
   return (
-    <div style={{ position: "relative" }}>
+    <div style={{ position: "relative", height: height }}>
       {/* Toolbar */}
       <div style={{
         position: "absolute", top: 10, left: 10, zIndex: 10,
@@ -440,7 +457,7 @@ function GraphCanvas({ nodes, edges, onSelectNode, selectedNodeId }) {
       <canvas
         ref={canvasRef}
         style={{
-          width: "100%", height: 520, borderRadius: 14,
+          width: "100%", height: "100%", borderRadius: 14,
           border: "1px solid rgba(60,60,100,0.3)", cursor: "grab", display: "block",
           background: "#0b0b1a",
         }}
@@ -664,6 +681,7 @@ function ConceptDetailPanel({ concept, onClose, onExplore, onDelete }) {
 export default function KnowledgeGraphPage() {
 
   const [subjects, setSubjects] = useState([]);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const [textbooks, setTextbooks] = useState([]);
   const [stats, setStats] = useState(null);
   // State
@@ -680,6 +698,7 @@ export default function KnowledgeGraphPage() {
 
   const [selectedNodeId, setSelectedNodeId] = useState(null);
   const [selectedConcept, setSelectedConcept] = useState(null);
+  const [graphViewMode, setGraphViewMode] = useState("3d");
   // Build state
 
   const [batchProcessing, setBatchProcessing] = useState(false);
@@ -696,6 +715,25 @@ export default function KnowledgeGraphPage() {
   useEffect(() => {
     if (selSubject && tab === "graph") loadGraph();
   }, [selSubject, selTypeFilter, tab]);
+
+  // Escape key handler for fullscreen mode
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === "Escape") {
+        setIsFullscreen(false);
+      }
+    };
+    if (isFullscreen) {
+      window.addEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = "hidden";
+    } else {
+      document.body.style.overflow = "";
+    }
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = "";
+    };
+  }, [isFullscreen]);
   async function loadData() {
 
     setLoading(true);
@@ -1150,38 +1188,72 @@ export default function KnowledgeGraphPage() {
             <div style={{ fontSize: 12, color: "var(--text-dim)" }}>
               {graphData.total_nodes || 0} nodes · {graphData.total_edges || 0} edges
               {selSubject && <> · {selSubject}</>}
-
             </div>
             <div style={{ flex: 1 }} />
+            
+            {/* View Mode Toggle */}
+            <div style={{
+              display: "flex",
+              gap: 2,
+              background: "var(--surface)",
+              padding: 2,
+              borderRadius: 8,
+              border: "1px solid var(--border-hi)"
+            }}>
+              <button
+                className={`btn btn-xs ${graphViewMode === "3d" ? "btn-primary" : "btn-secondary"}`}
+                style={{ padding: "4px 10px", fontSize: 11, borderRadius: 6, height: "auto" }}
+                onClick={() => setGraphViewMode("3d")}
+              >
+                3D Space
+              </button>
+              <button
+                className={`btn btn-xs ${graphViewMode === "2d" ? "btn-primary" : "btn-secondary"}`}
+                style={{ padding: "4px 10px", fontSize: 11, borderRadius: 6, height: "auto" }}
+                onClick={() => setGraphViewMode("2d")}
+              >
+                2D Radial
+              </button>
+            </div>
+
             <button className="btn btn-sm btn-secondary" onClick={loadGraph}>↻ Reload</button>
+            <button
+              className="btn btn-sm btn-primary"
+              style={{ display: "flex", alignItems: "center", gap: 6 }}
+              onClick={() => setIsFullscreen(true)}
+            >
+              ⛶ Fullscreen
+            </button>
           </div>
           <div style={{ position: "relative" }}>
-            <GraphCanvas
-              nodes={graphData.nodes}
-
-              edges={graphData.edges}
-
-              onSelectNode={handleSelectNode}
-
-              selectedNodeId={selectedNodeId}
-
-            />
+            {graphViewMode === "3d" ? (
+              <Graph3D
+                nodes={graphData.nodes}
+                edges={graphData.edges}
+                onSelectNode={handleSelectNode}
+                selectedNodeId={selectedNodeId}
+                height={520}
+              />
+            ) : (
+              <GraphCanvas
+                nodes={graphData.nodes}
+                edges={graphData.edges}
+                onSelectNode={handleSelectNode}
+                selectedNodeId={selectedNodeId}
+                height={520}
+              />
+            )}
             {selectedConcept && (
               <ConceptDetailPanel
                 concept={selectedConcept}
-
                 onClose={() => { setSelectedConcept(null); setSelectedNodeId(null); }}
-
                 onExplore={handleExplore}
-
                 onDelete={handleDeleteConcept}
-
               />
             )}
-
           </div>
           <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-dim)" }}>
-            💡 Click a node to see details · Drag nodes to rearrange · Click a neighbor to explore it
+            💡 {graphViewMode === "3d" ? "Left-click + drag to rotate · Right-click + drag to pan · Scroll to zoom · Click node to focus" : "Click a node to see details · Drag nodes to rearrange · Scroll to zoom"}
           </div>
         </div>
       )}
@@ -1501,6 +1573,289 @@ export default function KnowledgeGraphPage() {
       )}
 
       {toast && <div className={`toast toast-${toast.type}`}>{toast.msg}</div>}
+
+      {/* Fullscreen Graph Modal */}
+      {isFullscreen && (
+        <div style={{
+          position: "fixed",
+          inset: 0,
+          zIndex: 99999,
+          background: "#060614",
+          display: "flex",
+          flexDirection: "column",
+          fontFamily: "'Inter', sans-serif",
+        }}>
+          {/* Top Control Bar */}
+          <div style={{
+            height: 60,
+            background: "rgba(12,12,28,0.96)",
+            borderBottom: "1px solid rgba(80,80,120,0.35)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            padding: "0 24px",
+            gap: 16,
+            backdropFilter: "blur(12px)",
+            boxShadow: "0 4px 20px rgba(0,0,0,0.3)",
+          }}>
+            {/* Left: Title & Concept Counts */}
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <span style={{ fontSize: 18, fontWeight: 700, color: "#fff", display: "flex", alignItems: "center", gap: 8 }}>
+                <span>🕸️</span> Concept Mesh Explorer
+              </span>
+              <span style={{
+                fontSize: 10,
+                background: "rgba(129, 140, 248, 0.15)",
+                color: "#818cf8",
+                padding: "3px 10px",
+                borderRadius: 20,
+                fontFamily: "var(--mono)",
+                fontWeight: 600,
+                border: "1px solid rgba(129,140,248,0.25)"
+              }}>
+                {graphData.nodes.length} concepts · {graphData.edges.length} relations
+              </span>
+            </div>
+
+            {/* Middle: Filters & View Toggles */}
+            <div style={{ display: "flex", alignItems: "center", gap: 16, flex: 1, justifyContent: "center", maxWidth: 700 }}>
+              {/* Subject Dropdown */}
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ fontSize: 11, color: "#aab", fontWeight: 500 }}>Subject</span>
+                <select
+                  value={selSubject}
+                  onChange={e => { setSelSubject(e.target.value); setSelTextbook(""); }}
+                  style={{
+                    background: "#0d0d27",
+                    border: "1px solid rgba(80,80,120,0.5)",
+                    borderRadius: 6,
+                    color: "#fff",
+                    padding: "4px 10px",
+                    fontSize: 12,
+                    outline: "none",
+                    cursor: "pointer",
+                  }}
+                >
+                  <option value="">All Subjects</option>
+                  {subjects.map(s => <option key={s.subject} value={s.subject}>{s.subject}</option>)}
+                </select>
+              </div>
+
+              {/* Type Filter */}
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ fontSize: 11, color: "#aab", fontWeight: 500 }}>Type</span>
+                <select
+                  value={selTypeFilter}
+                  onChange={e => setSelTypeFilter(e.target.value)}
+                  style={{
+                    background: "#0d0d27",
+                    border: "1px solid rgba(80,80,120,0.5)",
+                    borderRadius: 6,
+                    color: "#fff",
+                    padding: "4px 10px",
+                    fontSize: 12,
+                    outline: "none",
+                    cursor: "pointer",
+                  }}
+                >
+                  <option value="">All Types</option>
+                  {Object.keys(TYPE_COLORS).map(t => (
+                    <option key={t} value={t}>{t}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* View Mode (3D/2D) Toggle */}
+              <div style={{
+                display: "flex",
+                gap: 2,
+                background: "#0d0d27",
+                padding: 2,
+                borderRadius: 6,
+                border: "1px solid rgba(80,80,120,0.5)"
+              }}>
+                <button
+                  className={`btn btn-xs ${graphViewMode === "3d" ? "btn-primary" : "btn-secondary"}`}
+                  style={{ padding: "4px 10px", fontSize: 10, borderRadius: 4, height: "auto", border: "none" }}
+                  onClick={() => setGraphViewMode("3d")}
+                >
+                  3D Space
+                </button>
+                <button
+                  className={`btn btn-xs ${graphViewMode === "2d" ? "btn-primary" : "btn-secondary"}`}
+                  style={{ padding: "4px 10px", fontSize: 10, borderRadius: 4, height: "auto", border: "none" }}
+                  onClick={() => setGraphViewMode("2d")}
+                >
+                  2D Radial
+                </button>
+              </div>
+
+              {/* Reload Button */}
+              <button
+                className="btn btn-xs btn-secondary"
+                style={{ height: "auto", padding: "5px 10px", fontSize: 11, borderRadius: 6, border: "1px solid rgba(80,80,120,0.4)" }}
+                onClick={loadGraph}
+              >
+                ↻ Reload
+              </button>
+            </div>
+
+            {/* Right: Search Input & Exit Fullscreen */}
+            <div style={{ display: "flex", alignItems: "center", gap: 14, position: "relative" }}>
+              {/* Search Box */}
+              <div style={{ width: 220, position: "relative" }}>
+                <input
+                  type="text"
+                  placeholder="🔍 Search concepts..."
+                  value={searchQuery}
+                  onChange={e => handleSearch(e.target.value)}
+                  style={{
+                    width: "100%",
+                    background: "#0d0d27",
+                    border: "1px solid rgba(80,80,120,0.5)",
+                    borderRadius: 6,
+                    color: "#fff",
+                    padding: "5px 10px 5px 28px",
+                    fontSize: 12,
+                    outline: "none",
+                  }}
+                />
+                <span style={{ position: "absolute", left: 8, top: "50%", transform: "translateY(-50%)", fontSize: 11, opacity: 0.5 }}>🔍</span>
+                {searchQuery.length > 0 && (
+                  <button
+                    onClick={() => { setSearchQuery(""); setSearchResults([]); }}
+                    style={{
+                      position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)",
+                      background: "transparent", border: "none", color: "#818cf8", cursor: "pointer", fontSize: 12
+                    }}
+                  >
+                    ✕
+                  </button>
+                )}
+
+                {/* Floating Search Results Dropdown */}
+                {searchQuery.length >= 2 && (
+                  <div style={{
+                    position: "absolute",
+                    top: 36,
+                    right: 0,
+                    width: 320,
+                    maxHeight: 350,
+                    overflowY: "auto",
+                    background: "rgba(10, 10, 24, 0.98)",
+                    border: "1px solid rgba(80, 80, 120, 0.6)",
+                    borderRadius: 8,
+                    boxShadow: "0 10px 30px rgba(0,0,0,0.7)",
+                    zIndex: 100000,
+                    padding: 6,
+                  }}>
+                    {searchResults.length === 0 ? (
+                      <div style={{ color: "var(--text-dim)", fontSize: 11, textAlign: "center", padding: 12 }}>
+                        No concepts found
+                      </div>
+                    ) : (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                        {searchResults.map(c => {
+                          const s = getTypeStyle(c.concept_type);
+                          return (
+                            <div
+                              key={c.id}
+                              onClick={() => {
+                                handleExplore(c.id);
+                                setSearchQuery("");
+                                setSearchResults([]);
+                              }}
+                              style={{
+                                padding: "6px 10px",
+                                borderRadius: 6,
+                                background: "rgba(255,255,255,0.03)",
+                                cursor: "pointer",
+                                transition: "all 0.15s",
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 8,
+                                border: "1px solid transparent",
+                              }}
+                              onMouseEnter={e => {
+                                e.currentTarget.style.border = "1px solid rgba(129, 140, 248, 0.4)";
+                                e.currentTarget.style.background = "rgba(129, 140, 248, 0.08)";
+                              }}
+                              onMouseLeave={e => {
+                                e.currentTarget.style.border = "1px solid transparent";
+                                e.currentTarget.style.background = "rgba(255,255,255,0.03)";
+                              }}
+                            >
+                              <div style={{ width: 6, height: 6, borderRadius: "50%", background: s.dot, flexShrink: 0 }} />
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <div style={{ fontSize: 12, fontWeight: 600, color: "#fff", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                  {c.name}
+                                </div>
+                                <div style={{ fontSize: 9, color: "var(--text-dim)" }}>
+                                  {c.concept_type} · 🔗 {c.relation_count} relations
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Exit Button */}
+              <button
+                className="btn btn-sm btn-secondary"
+                style={{
+                  background: "rgba(248,113,113,0.12)",
+                  color: "#f87171",
+                  border: "1px solid rgba(248,113,113,0.25)",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  fontSize: 12,
+                  fontWeight: 600,
+                  height: 32,
+                }}
+                onClick={() => setIsFullscreen(false)}
+              >
+                ✕ Exit <span style={{ fontSize: 9, opacity: 0.6, fontFamily: "var(--mono)" }}>[ESC]</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Fullscreen Viewport Area */}
+          <div style={{ flex: 1, position: "relative", width: "100%", height: "calc(100vh - 60px)", background: "#060614" }}>
+            {graphViewMode === "3d" ? (
+              <Graph3D
+                nodes={graphData.nodes}
+                edges={graphData.edges}
+                onSelectNode={handleSelectNode}
+                selectedNodeId={selectedNodeId}
+                height="100%"
+              />
+            ) : (
+              <GraphCanvas
+                nodes={graphData.nodes}
+                edges={graphData.edges}
+                onSelectNode={handleSelectNode}
+                selectedNodeId={selectedNodeId}
+                height="100%"
+              />
+            )}
+
+            {/* Float Detail Overlay in Fullscreen */}
+            {selectedConcept && (
+              <ConceptDetailPanel
+                concept={selectedConcept}
+                onClose={() => { setSelectedConcept(null); setSelectedNodeId(null); }}
+                onExplore={handleExplore}
+                onDelete={handleDeleteConcept}
+              />
+            )}
+          </div>
+        </div>
+      )}
 
     </div>
   );
