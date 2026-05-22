@@ -11,6 +11,18 @@ const PRESETS = {
   VSAQ: { label: "VSAQ", desc: "7-8 precise bullets", min: 7, max: 8, style: "precise" },
 };
 
+const MODE_INFO = {
+  auto:       { label: "Auto", desc: "Merged vector + graph chunks in one Claude call", color: "#94a3b8", icon: "⚡" },
+  graph_only: { label: "GraphRAG", desc: "Pure knowledge-graph retrieval, zero vector search", color: "#818cf8", icon: "🕸️" },
+  hybrid:     { label: "Hybrid Fusion", desc: "Two independent answers merged into one superior result (~2x tokens)", color: "#34d399", icon: "🧬" },
+};
+
+const PROVENANCE_STYLE = {
+  V: { label: "Vector", color: "#60a5fa", bg: "rgba(96,165,250,0.12)" },
+  G: { label: "Graph", color: "#818cf8", bg: "rgba(129,140,248,0.12)" },
+  F: { label: "Fused", color: "#34d399", bg: "rgba(52,211,153,0.12)" },
+};
+
 export default function AnswersPage() {
   const [mappings, setMappings] = useState([]);
   const [chapters, setChapters] = useState([]);
@@ -20,6 +32,7 @@ export default function AnswersPage() {
   const [preset, setPreset] = useState("SAQ");
   const [customCount, setCustomCount] = useState(10);
   const [customStyle, setCustomStyle] = useState("detailed");
+  const [mode, setMode] = useState("auto");
   const [filterChapter, setFilterChapter] = useState("");
   const [filterStatus, setFilterStatus] = useState("all");
   const [generating, setGenerating] = useState(false);
@@ -82,6 +95,7 @@ export default function AnswersPage() {
         preset,
         preset === "custom" ? customCount : null,
         preset === "custom" ? customStyle : null,
+        mode,
       );
       if (res.task_id) {
         connectProgress(res.task_id, (data) => {
@@ -138,7 +152,8 @@ export default function AnswersPage() {
 
   // Cost estimate
   const bulletCount = preset === "custom" ? customCount : Math.round((PRESETS[preset]?.min + PRESETS[preset]?.max) / 2);
-  const estimatedCost = (selected.length * (2000 * 1 + bulletCount * 50 * 5) / 1_000_000).toFixed(4);
+  const costMultiplier = mode === "hybrid" ? 2.5 : 1;
+  const estimatedCost = (selected.length * (2000 * 1 + bulletCount * 50 * 5) / 1_000_000 * costMultiplier).toFixed(4);
 
   if (loading) return <div className="loading-overlay"><div className="spinner" /> Loading...</div>;
 
@@ -147,7 +162,7 @@ export default function AnswersPage() {
       <div className="page-header">
         <div>
           <h1 className="page-title">✍️ Answer Generator</h1>
-          <p className="page-subtitle">Generate textbook-sourced answers for matched questions</p>
+          <p className="page-subtitle">Generate textbook-sourced answers with GraphRAG Hybrid Fusion</p>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <span style={{ fontSize: 12, color: "var(--text-dim)", fontFamily: "var(--mono)" }}>
@@ -231,6 +246,7 @@ export default function AnswersPage() {
           {selected.length > 0 && (
             <div style={{ fontSize: 11, color: "var(--text-dim)", fontFamily: "var(--mono)", paddingBottom: 6 }}>
               Est. ~${estimatedCost}
+              {mode === "hybrid" && <span style={{ color: "#fbbf24" }}> (2.5x)</span>}
             </div>
           )}
 
@@ -241,6 +257,43 @@ export default function AnswersPage() {
             disabled={generating || selected.length === 0}>
             {generating ? "Generating..." : `✍️ Generate (${selected.length})`}
           </button>
+        </div>
+
+        {/* ── Retrieval Mode Selector ── */}
+        <div style={{
+          marginTop: 14, paddingTop: 14, borderTop: "1px solid var(--border)",
+          display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap",
+        }}>
+          <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: 1 }}>
+            Retrieval Mode
+          </span>
+          <div style={{
+            display: "flex", gap: 3, background: "var(--surface)", padding: 3,
+            borderRadius: 10, border: "1px solid var(--border-hi)",
+          }}>
+            {Object.entries(MODE_INFO).map(([key, info]) => (
+              <button
+                key={key}
+                className={`btn btn-sm ${mode === key ? "btn-primary" : "btn-secondary"}`}
+                style={{
+                  fontSize: 11, padding: "5px 12px", borderRadius: 7, height: "auto",
+                  display: "flex", alignItems: "center", gap: 5,
+                  border: mode === key ? `1px solid ${info.color}` : "1px solid transparent",
+                  background: mode === key ? `${info.color}22` : "transparent",
+                  color: mode === key ? info.color : "var(--text-dim)",
+                  fontWeight: mode === key ? 700 : 400,
+                  transition: "all 0.2s",
+                }}
+                onClick={() => setMode(key)}
+              >
+                <span>{info.icon}</span>
+                <span>{info.label}</span>
+              </button>
+            ))}
+          </div>
+          <span style={{ fontSize: 11, color: "var(--text-dim)", fontStyle: "italic", maxWidth: 400 }}>
+            {MODE_INFO[mode]?.desc}
+          </span>
         </div>
 
         {/* Progress */}
@@ -275,6 +328,8 @@ export default function AnswersPage() {
                 {items.map((m) => {
                   const ans = answers[m.id];
                   const isSelected = selected.includes(m.id);
+                  const ansMode = ans?.retrieval_mode;
+                  const modeStyle = ansMode ? MODE_INFO[ansMode] : null;
                   return (
                     <div key={m.id} className="question-row" style={{
                       display: "flex", gap: 10, alignItems: "flex-start",
@@ -315,6 +370,15 @@ export default function AnswersPage() {
                           <span className="badge badge-high" style={{ fontSize: 10 }}>
                             {ans.preset} · {ans.bullet_count}pt
                           </span>
+                          {modeStyle && (
+                            <span style={{
+                              fontSize: 9, padding: "2px 6px", borderRadius: 10,
+                              background: `${modeStyle.color}18`, color: modeStyle.color,
+                              fontFamily: "var(--mono)", fontWeight: 600,
+                            }}>
+                              {modeStyle.icon} {modeStyle.label}
+                            </span>
+                          )}
                           <button className="btn btn-sm"
                             style={{ fontSize: 10, padding: "2px 6px", background: "transparent", color: "var(--accent)", border: "1px solid var(--border)" }}
                             onClick={e => { e.stopPropagation(); setViewAnswer(ans); }}>
@@ -362,12 +426,14 @@ function AnswerPreview({ answer, onClose, onDelete, onEdit }) {
   const [editPrologue, setEditPrologue] = useState(answer.prologue);
   const [editBullets, setEditBullets] = useState(answer.bullets || []);
   const [editEpilogue, setEditEpilogue] = useState(answer.epilogue);
+  const [showReport, setShowReport] = useState(false);
 
   useEffect(() => {
     setEditPrologue(answer.prologue);
     setEditBullets(answer.bullets || []);
     setEditEpilogue(answer.epilogue);
     setEditing(false);
+    setShowReport(false);
   }, [answer.id]);
 
   function updateBullet(idx, val) {
@@ -383,23 +449,67 @@ function AnswerPreview({ answer, onClose, onDelete, onEdit }) {
   }
 
   const pages = answer.source_pages ? Object.entries(answer.source_pages) : [];
+  const meta = answer.retrieval_metadata || {};
+  const modeStyle = MODE_INFO[answer.retrieval_mode] || MODE_INFO.auto;
+  const confidence = meta.confidence_score || 0;
+  const provenance = meta.bullet_provenance || [];
 
   return (
     <div style={{
-      width: 420, flexShrink: 0, background: "var(--surface)", border: "1px solid var(--border)",
+      width: 440, flexShrink: 0, background: "var(--surface)", border: "1px solid var(--border)",
       borderRadius: "var(--r)", padding: 16, position: "sticky", top: 16, maxHeight: "calc(100vh - 120px)",
       overflowY: "auto",
     }}>
       {/* Header */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+        <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
           <span className={`badge badge-${answer.status === "edited" ? "medium" : "high"}`} style={{ fontSize: 10 }}>
             {answer.preset} · {answer.bullet_count} bullets
           </span>
           <span className="badge badge-info" style={{ fontSize: 10 }}>{answer.status}</span>
+          {/* Mode badge */}
+          <span style={{
+            fontSize: 9, padding: "2px 7px", borderRadius: 10,
+            background: `${modeStyle.color}18`, color: modeStyle.color,
+            fontFamily: "var(--mono)", fontWeight: 600,
+          }}>
+            {modeStyle.icon} {modeStyle.label}
+          </span>
         </div>
         <button className="btn btn-sm btn-secondary" onClick={onClose} style={{ fontSize: 11 }}>✕</button>
       </div>
+
+      {/* Confidence Score Bar */}
+      {confidence > 0 && (
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+            <span style={{ fontSize: 10, fontWeight: 600, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: 0.8 }}>
+              Answer Confidence
+            </span>
+            <span style={{
+              fontSize: 12, fontWeight: 700,
+              color: confidence >= 70 ? "#34d399" : confidence >= 40 ? "#fbbf24" : "#f87171",
+              fontFamily: "var(--mono)",
+            }}>
+              {confidence}%
+            </span>
+          </div>
+          <div style={{
+            height: 4, borderRadius: 4, background: "var(--bg)",
+            overflow: "hidden",
+          }}>
+            <div style={{
+              height: "100%", borderRadius: 4, transition: "width 0.5s ease",
+              width: `${confidence}%`,
+              background: confidence >= 70
+                ? "linear-gradient(90deg, #34d399, #10b981)"
+                : confidence >= 40
+                  ? "linear-gradient(90deg, #fbbf24, #f59e0b)"
+                  : "linear-gradient(90deg, #f87171, #ef4444)",
+            }} />
+          </div>
+        </div>
+      )}
 
       {/* Question */}
       <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-bright)", marginBottom: 10, lineHeight: 1.4 }}>
@@ -467,22 +577,36 @@ function AnswerPreview({ answer, onClose, onDelete, onEdit }) {
             </div>
           )}
 
-          {/* Bullets */}
+          {/* Bullets with provenance badges */}
           <div style={{ marginBottom: 12 }}>
-            {(answer.bullets || []).map((b, i) => (
-              <div key={i} style={{
-                display: "flex", gap: 8, padding: "5px 0",
-                borderBottom: "1px solid rgba(255,255,255,0.03)",
-              }}>
-                <span style={{
-                  fontSize: 11, fontWeight: 700, color: "var(--accent)",
-                  minWidth: 20, fontFamily: "var(--mono)",
+            {(answer.bullets || []).map((b, i) => {
+              const prov = provenance[i];
+              const provStyle = prov ? PROVENANCE_STYLE[prov] : null;
+              return (
+                <div key={i} style={{
+                  display: "flex", gap: 8, padding: "5px 0",
+                  borderBottom: "1px solid rgba(255,255,255,0.03)",
                 }}>
-                  {String(i + 1).padStart(2, "0")}
-                </span>
-                <span style={{ fontSize: 12.5, color: "var(--text)", lineHeight: 1.5 }}>{b}</span>
-              </div>
-            ))}
+                  <span style={{
+                    fontSize: 11, fontWeight: 700, color: "var(--accent)",
+                    minWidth: 20, fontFamily: "var(--mono)",
+                  }}>
+                    {String(i + 1).padStart(2, "0")}
+                  </span>
+                  <span style={{ fontSize: 12.5, color: "var(--text)", lineHeight: 1.5, flex: 1 }}>{b}</span>
+                  {provStyle && (
+                    <span style={{
+                      fontSize: 8, padding: "2px 5px", borderRadius: 4, flexShrink: 0,
+                      background: provStyle.bg, color: provStyle.color,
+                      fontFamily: "var(--mono)", fontWeight: 700, alignSelf: "flex-start",
+                      marginTop: 2,
+                    }}>
+                      {provStyle.label}
+                    </span>
+                  )}
+                </div>
+              );
+            })}
           </div>
 
           {/* Epilogue */}
@@ -524,6 +648,98 @@ function AnswerPreview({ answer, onClose, onDelete, onEdit }) {
                   );
                 })}
               </div>
+            </div>
+          )}
+
+          {/* ── Retrieval Report (Explainability) ── */}
+          {meta && (meta.concepts_matched?.length > 0 || meta.relation_context?.length > 0) && (
+            <div style={{ marginBottom: 12 }}>
+              <button
+                className="btn btn-sm btn-secondary"
+                style={{ fontSize: 10, marginBottom: 8, display: "flex", alignItems: "center", gap: 4 }}
+                onClick={() => setShowReport(!showReport)}
+              >
+                📊 {showReport ? "Hide" : "Show"} Retrieval Report
+              </button>
+              {showReport && (
+                <div style={{
+                  padding: 12, borderRadius: 8,
+                  background: "rgba(129,140,248,0.05)",
+                  border: "1px solid rgba(129,140,248,0.15)",
+                }}>
+                  {/* Mode & Stats */}
+                  <div style={{ fontSize: 11, color: "var(--text)", marginBottom: 8, lineHeight: 1.5 }}>
+                    <strong style={{ color: modeStyle.color }}>{modeStyle.icon} {modeStyle.label}</strong> retrieval
+                    <br />
+                    <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: "var(--text-dim)" }}>
+                      Vector chunks: {meta.vector_chunks_used || 0} · Graph chunks: {meta.graph_chunks_used || 0}
+                      {meta.overlap_count > 0 && ` · Overlap: ${meta.overlap_count}`}
+                    </span>
+                  </div>
+
+                  {/* Concepts Matched */}
+                  {meta.concepts_matched?.length > 0 && (
+                    <div style={{ marginBottom: 8 }}>
+                      <div style={{ fontSize: 9, fontWeight: 700, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: 1, marginBottom: 4 }}>
+                        Concepts Matched ({meta.concepts_matched.length})
+                      </div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 3 }}>
+                        {meta.concepts_matched.map((c, i) => (
+                          <span key={i} style={{
+                            fontSize: 10, padding: "2px 7px", borderRadius: 10,
+                            background: "rgba(129,140,248,0.12)", color: "#818cf8",
+                            fontWeight: 500,
+                          }}>
+                            {c}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Relation Chains */}
+                  {meta.relation_context?.length > 0 && (
+                    <div style={{ marginBottom: 8 }}>
+                      <div style={{ fontSize: 9, fontWeight: 700, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: 1, marginBottom: 4 }}>
+                        Relation Chains ({meta.relation_context.length})
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                        {meta.relation_context.slice(0, 8).map((rc, i) => (
+                          <div key={i} style={{
+                            fontSize: 10, color: "var(--text)", fontFamily: "var(--mono)",
+                            padding: "2px 6px", borderRadius: 4,
+                            background: "rgba(52,211,153,0.06)",
+                          }}>
+                            {rc}
+                          </div>
+                        ))}
+                        {meta.relation_context.length > 8 && (
+                          <div style={{ fontSize: 9, color: "var(--text-dim)", fontStyle: "italic" }}>
+                            +{meta.relation_context.length - 8} more...
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Fusion Notes */}
+                  {meta.fusion_notes && (
+                    <div>
+                      <div style={{ fontSize: 9, fontWeight: 700, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: 1, marginBottom: 4 }}>
+                        Fusion Notes
+                      </div>
+                      <div style={{
+                        fontSize: 11, color: "var(--text)", lineHeight: 1.4,
+                        padding: "6px 8px", borderRadius: 4,
+                        background: "rgba(52,211,153,0.08)",
+                        borderLeft: "2px solid #34d399",
+                      }}>
+                        {meta.fusion_notes}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
 

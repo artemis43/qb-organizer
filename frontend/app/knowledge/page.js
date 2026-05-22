@@ -699,6 +699,44 @@ export default function KnowledgeGraphPage() {
   const [selectedNodeId, setSelectedNodeId] = useState(null);
   const [selectedConcept, setSelectedConcept] = useState(null);
   const [graphViewMode, setGraphViewMode] = useState("3d");
+  // Advanced filters (Feature 5)
+  const [importanceFilter, setImportanceFilter] = useState(""); // "" = all, "must_know", "standard", "advanced"
+  const [activeRelationTypes, setActiveRelationTypes] = useState(new Set(Object.keys(RELATION_LABELS))); // all on by default
+  const [showRelFilters, setShowRelFilters] = useState(false);
+
+  // Client-side filtered graph data
+  const filteredGraphData = (() => {
+    let nodes = graphData.nodes || [];
+    let edges = graphData.edges || [];
+    // Filter by importance
+    if (importanceFilter) {
+      nodes = nodes.filter(n => n.importance === importanceFilter);
+    }
+    // Filter edges by relation type
+    if (activeRelationTypes.size < Object.keys(RELATION_LABELS).length) {
+      edges = edges.filter(e => activeRelationTypes.has(e.relation_type));
+    }
+    // Only keep edges whose source/target are in the filtered nodes set
+    const nodeIds = new Set(nodes.map(n => n.id));
+    edges = edges.filter(e => nodeIds.has(e.source) && nodeIds.has(e.target));
+    return { ...graphData, nodes, edges, total_nodes: nodes.length, total_edges: edges.length };
+  })();
+
+  function toggleRelationType(type) {
+    setActiveRelationTypes(prev => {
+      const next = new Set(prev);
+      if (next.has(type)) {
+        if (next.size > 1) next.delete(type); // Prevent deselecting all
+      } else {
+        next.add(type);
+      }
+      return next;
+    });
+  }
+
+  function resetRelationFilters() {
+    setActiveRelationTypes(new Set(Object.keys(RELATION_LABELS)));
+  }
   // Build state
 
   const [batchProcessing, setBatchProcessing] = useState(false);
@@ -1184,60 +1222,115 @@ export default function KnowledgeGraphPage() {
 
       {tab === "graph" && (
         <div>
-          <div style={{ display: "flex", gap: 8, marginBottom: 12, alignItems: "center" }}>
+          {/* Graph Toolbar */}
+          <div style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center" }}>
             <div style={{ fontSize: 12, color: "var(--text-dim)" }}>
-              {graphData.total_nodes || 0} nodes · {graphData.total_edges || 0} edges
+              {filteredGraphData.total_nodes || 0} nodes · {filteredGraphData.total_edges || 0} edges
               {selSubject && <> · {selSubject}</>}
+              {importanceFilter && <span style={{ color: IMPORTANCE_COLORS[importanceFilter]?.color }}> · {IMPORTANCE_COLORS[importanceFilter]?.label}</span>}
             </div>
             <div style={{ flex: 1 }} />
-            
+
             {/* View Mode Toggle */}
             <div style={{
-              display: "flex",
-              gap: 2,
-              background: "var(--surface)",
-              padding: 2,
-              borderRadius: 8,
-              border: "1px solid var(--border-hi)"
+              display: "flex", gap: 2, background: "var(--surface)",
+              padding: 2, borderRadius: 8, border: "1px solid var(--border-hi)"
             }}>
-              <button
-                className={`btn btn-xs ${graphViewMode === "3d" ? "btn-primary" : "btn-secondary"}`}
+              <button className={`btn btn-xs ${graphViewMode === "3d" ? "btn-primary" : "btn-secondary"}`}
                 style={{ padding: "4px 10px", fontSize: 11, borderRadius: 6, height: "auto" }}
-                onClick={() => setGraphViewMode("3d")}
-              >
-                3D Space
-              </button>
-              <button
-                className={`btn btn-xs ${graphViewMode === "2d" ? "btn-primary" : "btn-secondary"}`}
+                onClick={() => setGraphViewMode("3d")}>3D Space</button>
+              <button className={`btn btn-xs ${graphViewMode === "2d" ? "btn-primary" : "btn-secondary"}`}
                 style={{ padding: "4px 10px", fontSize: 11, borderRadius: 6, height: "auto" }}
-                onClick={() => setGraphViewMode("2d")}
-              >
-                2D Radial
-              </button>
+                onClick={() => setGraphViewMode("2d")}>2D Radial</button>
+            </div>
+            <button className="btn btn-sm btn-secondary" onClick={loadGraph}>↻ Reload</button>
+            <button className="btn btn-sm btn-primary"
+              style={{ display: "flex", alignItems: "center", gap: 6 }}
+              onClick={() => setIsFullscreen(true)}>⛶ Fullscreen</button>
+          </div>
+
+          {/* ── Importance + Relation Filters ── */}
+          <div style={{
+            display: "flex", gap: 8, marginBottom: 12, alignItems: "center",
+            padding: "8px 12px", borderRadius: 8,
+            background: "var(--surface)", border: "1px solid var(--border)",
+            flexWrap: "wrap",
+          }}>
+            {/* Importance Filters */}
+            <span style={{ fontSize: 10, fontWeight: 700, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: 1 }}>Importance</span>
+            <div style={{ display: "flex", gap: 3 }}>
+              {["", "must_know", "standard", "advanced"].map(imp => {
+                const label = imp ? IMPORTANCE_COLORS[imp]?.label : "All";
+                const color = imp ? IMPORTANCE_COLORS[imp]?.color : "var(--text-dim)";
+                return (
+                  <button key={imp}
+                    className={`btn btn-xs ${importanceFilter === imp ? "btn-primary" : "btn-secondary"}`}
+                    style={{
+                      fontSize: 10, padding: "3px 10px", borderRadius: 6, height: "auto",
+                      border: importanceFilter === imp ? `1px solid ${color}` : "1px solid transparent",
+                      background: importanceFilter === imp ? `${color}22` : "transparent",
+                      color: importanceFilter === imp ? color : "var(--text-dim)",
+                      fontWeight: importanceFilter === imp ? 700 : 400,
+                    }}
+                    onClick={() => setImportanceFilter(imp)}>
+                    {label}
+                  </button>
+                );
+              })}
             </div>
 
-            <button className="btn btn-sm btn-secondary" onClick={loadGraph}>↻ Reload</button>
-            <button
-              className="btn btn-sm btn-primary"
-              style={{ display: "flex", alignItems: "center", gap: 6 }}
-              onClick={() => setIsFullscreen(true)}
-            >
-              ⛶ Fullscreen
+            <div style={{ width: 1, height: 20, background: "var(--border)" }} />
+
+            {/* Relation Type Filters */}
+            <span style={{ fontSize: 10, fontWeight: 700, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: 1 }}>Relations</span>
+            <button className="btn btn-xs btn-secondary"
+              style={{ fontSize: 10, padding: "3px 8px", borderRadius: 6, height: "auto" }}
+              onClick={() => setShowRelFilters(!showRelFilters)}>
+              {activeRelationTypes.size}/{Object.keys(RELATION_LABELS).length} active {showRelFilters ? "▲" : "▼"}
             </button>
+            {activeRelationTypes.size < Object.keys(RELATION_LABELS).length && (
+              <button className="btn btn-xs" style={{ fontSize: 9, color: "var(--accent)", background: "transparent", padding: "2px 6px" }}
+                onClick={resetRelationFilters}>Reset</button>
+            )}
           </div>
+
+          {/* Relation type dropdown */}
+          {showRelFilters && (
+            <div style={{
+              display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 12,
+              padding: "8px 12px", borderRadius: 8,
+              background: "var(--surface)", border: "1px solid var(--border)",
+            }}>
+              {Object.entries(RELATION_LABELS).map(([key, label]) => (
+                <button key={key}
+                  style={{
+                    fontSize: 10, padding: "3px 8px", borderRadius: 5, height: "auto",
+                    border: "1px solid var(--border)", cursor: "pointer",
+                    background: activeRelationTypes.has(key) ? "rgba(129,140,248,0.15)" : "transparent",
+                    color: activeRelationTypes.has(key) ? "#818cf8" : "var(--text-dim)",
+                    fontWeight: activeRelationTypes.has(key) ? 600 : 400,
+                    transition: "all 0.15s",
+                  }}
+                  onClick={() => toggleRelationType(key)}>
+                  {activeRelationTypes.has(key) ? "✓ " : ""}{label}
+                </button>
+              ))}
+            </div>
+          )}
+
           <div style={{ position: "relative" }}>
             {graphViewMode === "3d" ? (
               <Graph3D
-                nodes={graphData.nodes}
-                edges={graphData.edges}
+                nodes={filteredGraphData.nodes}
+                edges={filteredGraphData.edges}
                 onSelectNode={handleSelectNode}
                 selectedNodeId={selectedNodeId}
                 height={520}
               />
             ) : (
               <GraphCanvas
-                nodes={graphData.nodes}
-                edges={graphData.edges}
+                nodes={filteredGraphData.nodes}
+                edges={filteredGraphData.edges}
                 onSelectNode={handleSelectNode}
                 selectedNodeId={selectedNodeId}
                 height={520}
@@ -1665,39 +1758,59 @@ export default function KnowledgeGraphPage() {
                 </select>
               </div>
 
+              {/* Importance Filters in Fullscreen */}
+              <div style={{ display: "flex", gap: 3 }}>
+                {["", "must_know", "standard", "advanced"].map(imp => {
+                  const label = imp ? (IMPORTANCE_COLORS[imp]?.label || imp) : "All";
+                  const color = imp ? IMPORTANCE_COLORS[imp]?.color : "#94a3b8";
+                  return (
+                    <button key={imp}
+                      style={{
+                        fontSize: 10, padding: "4px 10px", borderRadius: 5, height: "auto",
+                        background: importanceFilter === imp ? `${color}22` : "transparent",
+                        border: importanceFilter === imp ? `1px solid ${color}55` : "1px solid rgba(80,80,120,0.3)",
+                        color: importanceFilter === imp ? color : "#8888aa",
+                        fontWeight: importanceFilter === imp ? 700 : 400,
+                        cursor: "pointer",
+                        transition: "all 0.15s",
+                      }}
+                      onClick={() => setImportanceFilter(imp)}>
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Relation Filter Button */}
+              <button
+                style={{
+                  fontSize: 10, padding: "4px 10px", borderRadius: 5, height: "auto",
+                  background: showRelFilters ? "rgba(129,140,248,0.15)" : "transparent",
+                  border: "1px solid rgba(80,80,120,0.4)",
+                  color: showRelFilters ? "#818cf8" : "#8888aa",
+                  cursor: "pointer",
+                }}
+                onClick={() => setShowRelFilters(!showRelFilters)}>
+                🔗 Relations {activeRelationTypes.size}/{Object.keys(RELATION_LABELS).length}
+              </button>
+
               {/* View Mode (3D/2D) Toggle */}
               <div style={{
-                display: "flex",
-                gap: 2,
-                background: "#0d0d27",
-                padding: 2,
-                borderRadius: 6,
-                border: "1px solid rgba(80,80,120,0.5)"
+                display: "flex", gap: 2, background: "#0d0d27",
+                padding: 2, borderRadius: 6, border: "1px solid rgba(80,80,120,0.5)"
               }}>
-                <button
-                  className={`btn btn-xs ${graphViewMode === "3d" ? "btn-primary" : "btn-secondary"}`}
+                <button className={`btn btn-xs ${graphViewMode === "3d" ? "btn-primary" : "btn-secondary"}`}
                   style={{ padding: "4px 10px", fontSize: 10, borderRadius: 4, height: "auto", border: "none" }}
-                  onClick={() => setGraphViewMode("3d")}
-                >
-                  3D Space
-                </button>
-                <button
-                  className={`btn btn-xs ${graphViewMode === "2d" ? "btn-primary" : "btn-secondary"}`}
+                  onClick={() => setGraphViewMode("3d")}>3D Space</button>
+                <button className={`btn btn-xs ${graphViewMode === "2d" ? "btn-primary" : "btn-secondary"}`}
                   style={{ padding: "4px 10px", fontSize: 10, borderRadius: 4, height: "auto", border: "none" }}
-                  onClick={() => setGraphViewMode("2d")}
-                >
-                  2D Radial
-                </button>
+                  onClick={() => setGraphViewMode("2d")}>2D Radial</button>
               </div>
 
               {/* Reload Button */}
-              <button
-                className="btn btn-xs btn-secondary"
+              <button className="btn btn-xs btn-secondary"
                 style={{ height: "auto", padding: "5px 10px", fontSize: 11, borderRadius: 6, border: "1px solid rgba(80,80,120,0.4)" }}
-                onClick={loadGraph}
-              >
-                ↻ Reload
-              </button>
+                onClick={loadGraph}>↻ Reload</button>
             </div>
 
             {/* Right: Search Input & Exit Fullscreen */}
@@ -1824,25 +1937,77 @@ export default function KnowledgeGraphPage() {
             </div>
           </div>
 
+          {/* Relation type filter panel (fullscreen) */}
+          {showRelFilters && (
+            <div style={{
+              background: "rgba(12,12,28,0.96)",
+              borderBottom: "1px solid rgba(80,80,120,0.35)",
+              padding: "8px 24px",
+              display: "flex", flexWrap: "wrap", gap: 4, alignItems: "center",
+            }}>
+              <span style={{ fontSize: 10, color: "#8888aa", fontWeight: 600, marginRight: 8 }}>FILTER EDGES:</span>
+              {Object.entries(RELATION_LABELS).map(([key, label]) => (
+                <button key={key}
+                  style={{
+                    fontSize: 10, padding: "3px 8px", borderRadius: 5, height: "auto",
+                    border: "1px solid rgba(80,80,120,0.4)", cursor: "pointer",
+                    background: activeRelationTypes.has(key) ? "rgba(129,140,248,0.15)" : "transparent",
+                    color: activeRelationTypes.has(key) ? "#818cf8" : "#666",
+                    fontWeight: activeRelationTypes.has(key) ? 600 : 400,
+                    transition: "all 0.15s",
+                  }}
+                  onClick={() => toggleRelationType(key)}>
+                  {activeRelationTypes.has(key) ? "✓ " : ""}{label}
+                </button>
+              ))}
+              <button style={{ fontSize: 9, color: "#818cf8", background: "transparent", border: "none", cursor: "pointer", marginLeft: 8 }}
+                onClick={resetRelationFilters}>Reset All</button>
+            </div>
+          )}
+
           {/* Fullscreen Viewport Area */}
-          <div style={{ flex: 1, position: "relative", width: "100%", height: "calc(100vh - 60px)", background: "#060614" }}>
+          <div style={{ flex: 1, position: "relative", width: "100%", height: showRelFilters ? "calc(100vh - 100px)" : "calc(100vh - 60px)", background: "#060614" }}>
             {graphViewMode === "3d" ? (
               <Graph3D
-                nodes={graphData.nodes}
-                edges={graphData.edges}
+                nodes={filteredGraphData.nodes}
+                edges={filteredGraphData.edges}
                 onSelectNode={handleSelectNode}
                 selectedNodeId={selectedNodeId}
                 height="100%"
               />
             ) : (
               <GraphCanvas
-                nodes={graphData.nodes}
-                edges={graphData.edges}
+                nodes={filteredGraphData.nodes}
+                edges={filteredGraphData.edges}
                 onSelectNode={handleSelectNode}
                 selectedNodeId={selectedNodeId}
                 height="100%"
               />
             )}
+
+            {/* Floating HUD Overlay (bottom-left) */}
+            <div style={{
+              position: "absolute", bottom: 16, left: 16,
+              background: "rgba(10,10,24,0.85)", backdropFilter: "blur(8px)",
+              border: "1px solid rgba(80,80,120,0.3)",
+              borderRadius: 10, padding: "8px 14px",
+              fontSize: 10, color: "#aab", fontFamily: "var(--mono)",
+              display: "flex", flexDirection: "column", gap: 4,
+              maxWidth: 300,
+            }}>
+              <div style={{ fontWeight: 700, color: "#fff", fontSize: 11 }}>
+                📊 {filteredGraphData.total_nodes} / {(graphData.nodes || []).length} nodes
+                · {filteredGraphData.total_edges} / {(graphData.edges || []).length} edges
+              </div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {importanceFilter ? (
+                  <span style={{ color: IMPORTANCE_COLORS[importanceFilter]?.color }}>▪ {IMPORTANCE_COLORS[importanceFilter]?.label}</span>
+                ) : (
+                  <span>▪ All importance</span>
+                )}
+                <span>▪ {activeRelationTypes.size}/{Object.keys(RELATION_LABELS).length} relation types</span>
+              </div>
+            </div>
 
             {/* Float Detail Overlay in Fullscreen */}
             {selectedConcept && (

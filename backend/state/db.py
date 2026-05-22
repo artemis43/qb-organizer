@@ -178,6 +178,8 @@ CREATE TABLE IF NOT EXISTS answers (
     model_used TEXT,
     token_cost REAL DEFAULT 0,
     status TEXT DEFAULT 'generated',  -- generated, edited, approved
+    retrieval_mode TEXT DEFAULT 'auto',  -- auto, graph_only, hybrid
+    retrieval_metadata TEXT,             -- JSON: concepts matched, chains, provenance
     FOREIGN KEY (mapping_id) REFERENCES mappings(id)
 );
 
@@ -309,6 +311,18 @@ async def init_db():
                 await db.commit()
             except Exception:
                 pass  # Already exists
+
+        # Migration: add retrieval_mode and retrieval_metadata to answers
+        try:
+            await db.execute("SELECT retrieval_mode FROM answers LIMIT 1")
+        except Exception:
+            try:
+                await db.execute("ALTER TABLE answers ADD COLUMN retrieval_mode TEXT DEFAULT 'auto'")
+                await db.execute("ALTER TABLE answers ADD COLUMN retrieval_metadata TEXT")
+                await db.commit()
+                logger.info("Migration: added retrieval_mode/retrieval_metadata to answers")
+            except Exception:
+                pass
 
     logger.info(f"Database initialized at {DB_PATH}")
 

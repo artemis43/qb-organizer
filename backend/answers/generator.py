@@ -1,13 +1,17 @@
 # qb-organizer/backend/answers/generator.py
-"""On-demand answer generation using RAG (Retrieval-Augmented Generation).
+"""On-demand answer generation with GraphRAG Hybrid Fusion.
+
+Supports three retrieval modes:
+  - auto:       Merged vector+graph chunks in a single Claude call (original behavior)
+  - graph_only: Pure knowledge-graph-guided retrieval, zero vector search
+  - hybrid:     Two independent Claude calls (vector-only + graph-only),
+                then a fusion pass that merges, deduplicates, and ranks
 
 Flow per question:
-1. Retrieve top-5 textbook chunks from the matched chapter via ChromaDB (FREE)
-2. Send chunks + question to Claude for structured formatting
-3. Claude outputs: { prologue, bullets[], epilogue } — sourced from textbook only
-4. Store in DB with source page references
-
-Batches up to 5 questions per Claude call for efficiency.
+1. Retrieve textbook chunks via the selected retrieval path(s)
+2. Send chunks + question to Claude for structured answer generation
+3. (hybrid only) Run fusion pass to merge two candidate answers
+4. Store in DB with source page references and retrieval metadata
 """
 
 import json
@@ -19,7 +23,11 @@ from config import settings
 from core import embedder
 from claude.client import get_claude_client
 from state import db as database
-from knowledge.graph_builder import get_concepts_for_question, get_related_chunk_ids
+from knowledge.graph_builder import (
+    get_concepts_for_question,
+    get_related_chunk_ids,
+    get_extended_concepts_for_question,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +54,7 @@ def resolve_preset(preset: str, custom_count: int = None, custom_style: str = No
     return custom_count or 8, custom_style or "detailed"
 
 
-# ── System Prompt ─────────────────────────────────────────────────
+# ── System Prompts ────────────────────────────────────────────────
 
 ANSWER_SYSTEM = """You are a senior medical professor writing textbook-quality exam answers for MBBS students.
 
@@ -73,10 +81,147 @@ BULLET STYLE GUIDE:
 - "precise": Each bullet should be exactly 1 concise sentence — fact-dense, no elaboration."""
 
 
-# ── Context Retrieval ─────────────────────────────────────────────
+ANSWER_SYSTEM_WITH_GRAPH = """You are a senior medical professor writing textbook-quality exam answers for MBBS students.
+
+You are given textbook excerpts AND a KNOWLEDGE GRAPH CONTEXT showing structured relationships between medical concepts (e.g., "Disease --[presents_with]--> Symptom"). Use both to write a comprehensive, structurally-aware answer.
+
+STRICT RULES:
+1. Use the provided textbook excerpts as your PRIMARY source material.
+2. Use the knowledge graph context to ensure your answer covers key relationships (causes, symptoms, treatments, investigations) systematically — do not miss important connections shown in the graph.
+3. Every bullet point must be substantive and factual.
+4. If the textbook excerpts do not contain enough information for the requested number of bullets, simply use as many bullets as the content genuinely supports — do NOT add any disclaimer.
+
+OUTPUT FORMAT — respond with ONLY valid JSON:
+{
+  "answers": [
+    {
+      "question_index": 0,
+      "prologue": "1-2 introductory sentences that set context for the topic.",
+      "bullets": ["Point 1...", "Point 2...", "..."],
+      "epilogue": "1-2 concluding sentences summarizing clinical significance.",
+      "source_quality": "good|partial|insufficient"
+    }
+  ]
+}
+
+BULLET STYLE GUIDE:
+- "detailed": Each bullet should be 1-3 sentences with explanation, mechanism, or clinical correlation. Use **bold** for key medical terms.
+- "precise": Each bullet should be exactly 1 concise sentence — fact-dense, no elaboration."""
+
+
+FUSION_SYSTEM = """You are a senior medical professor. You have received TWO candidate answers for the same exam question:
+
+- ANSWER A: Generated from vector-similarity textbook retrieval (keyword-matched chunks).
+- ANSWER B: Generated from knowledge-graph-guided retrieval (concept-relation-aware chunks).
+
+Your task is to MERGE them into ONE superior, definitive answer.
+
+FUSION RULES:
+1. Remove duplicate or near-duplicate bullet points — keep the more specific/detailed version.
+2. Remove vague, generic, or unsupported bullets (e.g., "This is clinically important" with no substance).
+3. Preserve clinically accurate, fact-dense bullets from BOTH sources.
+4. Order bullets logically: definition/etiology first, then pathophysiology, clinical features, investigations, management, complications.
+5. The merged prologue should be the better of the two (more informative).
+6. The merged epilogue should be the better of the two (more clinically relevant).
+7. For each bullet in the merged answer, indicate its provenance: "V" if it came primarily from Answer A (vector), "G" if from Answer B (graph), "F" if you fused information from both.
+
+OUTPUT FORMAT — respond with ONLY valid JSON:
+{
+  "prologue": "...",
+  "bullets": ["Point 1...", "Point 2...", "..."],
+  "bullet_provenance": ["V", "G", "F", "V", "G", ...],
+  "epilogue": "...",
+  "fusion_notes": "Brief explanation of what was merged, removed, or improved."
+}"""
+
+
+# ── Context Retrieval Functions ───────────────────────────────────
+
+async def _retrieve_vector_context(
+    question_text: str, chapter_id: str, subject: str, n_chunks: int = 5
+) -> tuple[list[dict], dict]:
+    """Layer 1: Pure vector similarity search (ChromaDB).
+
+    Returns: (chunks, metadata)
+    """
+    results = embedder.search_similar(
+        subject, question_text, n_results=n_chunks,
+        filter_chapter_id=chapter_id,
+    )
+    if not results:
+        results = embedder.search_similar(subject, question_text, n_results=n_chunks)
+
+    metadata = {
+        "source": "vector",
+        "chunks_retrieved": len(results),
+    }
+    return results, metadata
+
+
+async def _retrieve_graph_context(
+    question_text: str, subject: str, n_chunks: int = 8
+) -> tuple[list[dict], dict]:
+    """Layer 2: Pure knowledge-graph-guided retrieval.
+
+    Finds concepts matching the question, traverses 1-hop neighbors,
+    retrieves associated chunks from concept_sources.
+
+    Returns: (chunks, metadata_with_graph_context)
+    """
+    results = []
+    metadata = {
+        "source": "graph",
+        "chunks_retrieved": 0,
+        "concepts_matched": [],
+        "relation_context": [],
+        "direct_concepts": 0,
+        "neighbor_concepts": 0,
+    }
+
+    try:
+        extended = await get_extended_concepts_for_question(question_text, subject, limit=10)
+
+        metadata["concepts_matched"] = extended["concept_names"]
+        metadata["relation_context"] = extended["relation_context"]
+        metadata["direct_concepts"] = extended["direct_count"]
+        metadata["neighbor_concepts"] = extended["neighbor_count"]
+
+        if extended["concept_ids"]:
+            graph_chunk_ids = await get_related_chunk_ids(extended["concept_ids"], subject)
+
+            seen_ids = set()
+            for chunk_id in graph_chunk_ids[:n_chunks + 6]:
+                if chunk_id in seen_ids:
+                    continue
+                chunk_rows = await database.fetch_all("chunks", "id = ?", (chunk_id,))
+                if chunk_rows:
+                    c = chunk_rows[0]
+                    results.append({
+                        "id": c["id"],
+                        "text": c["text"],
+                        "distance": 0.3,
+                        "similarity": 0.7,
+                        "metadata": {
+                            "chapter_id": c.get("chapter_id", ""),
+                            "textbook_id": c.get("textbook_id", ""),
+                            "page_numbers": c.get("page_numbers", "[]"),
+                            "section_heading": c.get("section_heading", ""),
+                            "chunk_index": c.get("chunk_index", 0),
+                            "source": "graph",
+                        },
+                    })
+                    seen_ids.add(chunk_id)
+
+        metadata["chunks_retrieved"] = len(results)
+
+    except Exception as e:
+        logger.warning(f"GraphRAG retrieval failed: {e}")
+
+    return results, metadata
+
 
 async def _retrieve_context(question_text: str, chapter_id: str, subject: str, n_chunks: int = 5) -> list[dict]:
-    """Retrieve relevant textbook chunks with GraphRAG enhancement.
+    """Retrieve relevant textbook chunks with GraphRAG enhancement (auto mode).
 
     Layer 1: Vector similarity search in the matched chapter (existing behaviour)
     Layer 2: Knowledge graph lookup — find concepts in the question, get their
@@ -142,6 +287,8 @@ async def _retrieve_context(question_text: str, chapter_id: str, subject: str, n
     max_results = n_chunks + 4
     return results[:max_results]
 
+
+# ── Helpers ───────────────────────────────────────────────────────
 
 def _extract_pages(chunks: list[dict], textbook_name: str) -> dict:
     """Extract exact page references from retrieved chunks."""
@@ -327,13 +474,127 @@ async def _find_relevant_images(
     return result
 
 
-# ── Batch Generation ──────────────────────────────────────────────
+def _compute_confidence(
+    vector_chunks: int, graph_chunks: int, overlap_count: int,
+    concepts_matched: int, relations_count: int
+) -> int:
+    """Compute an answer confidence score (0-100) based on retrieval quality."""
+    score = 0
+
+    # Base: did we find ANY chunks?
+    if vector_chunks > 0:
+        score += 20
+    if graph_chunks > 0:
+        score += 20
+
+    # Overlap bonus: if vector and graph found the same chunks, high confidence
+    if overlap_count > 0:
+        score += min(overlap_count * 8, 24)
+
+    # Concepts matched
+    if concepts_matched > 0:
+        score += min(concepts_matched * 5, 20)
+
+    # Relations used (structural grounding)
+    if relations_count > 0:
+        score += min(relations_count * 3, 16)
+
+    return min(score, 100)
+
+
+# ── Claude Call Helper ────────────────────────────────────────────
+
+async def _call_claude_for_answer(
+    items: list[dict],
+    preset: str,
+    bullet_count: int,
+    bullet_style: str,
+    system_prompt: str,
+    subject: str,
+    extra_context: str = "",
+) -> list[dict]:
+    """Build prompt from items and call Claude. Returns parsed answers list."""
+    prompt_parts = []
+    for i, item in enumerate(items):
+        part = (
+            f"QUESTION {i} ({preset}, {bullet_count} {bullet_style} bullets):\n"
+            f"{item['question_text']}\n\n"
+            f"TEXTBOOK SOURCE (Chapter: {item['chapter_name']}):\n"
+            f"{item['context']}\n"
+        )
+        if extra_context and item.get("graph_context"):
+            part += f"\nKNOWLEDGE GRAPH CONTEXT:\n{item['graph_context']}\n"
+        prompt_parts.append(part)
+
+    full_prompt = "\n\n{'='*60}\n\n".join(prompt_parts)
+    full_prompt += (
+        f"\n\nGenerate answers for ALL {len(items)} questions above. "
+        f"Each answer must have exactly {bullet_count} {bullet_style} bullet points "
+        f"(unless source material is insufficient). Return the JSON."
+    )
+
+    client = get_claude_client()
+    response = await client.request(
+        messages=[{"role": "user", "content": full_prompt}],
+        system=system_prompt,
+        model=settings.haiku_model,
+        max_tokens=8192,
+        task_type="answer_generation",
+        subject=subject,
+        request_id=f"ans_{uuid.uuid4().hex[:8]}",
+    )
+
+    return response.get("answers", [])
+
+
+async def _fuse_answers(
+    question_text: str,
+    answer_a: dict,
+    answer_b: dict,
+    bullet_count: int,
+    subject: str,
+) -> dict:
+    """Fusion pass: merge two candidate answers into one superior answer."""
+
+    bullets_a = answer_a.get("bullets", [])
+    bullets_b = answer_b.get("bullets", [])
+
+    prompt = (
+        f"QUESTION:\n{question_text}\n\n"
+        f"ANSWER A (Vector-similarity RAG, {len(bullets_a)} bullets):\n"
+        f"Prologue: {answer_a.get('prologue', '')}\n"
+        f"Bullets:\n" + "\n".join(f"  {i+1}. {b}" for i, b in enumerate(bullets_a)) + "\n"
+        f"Epilogue: {answer_a.get('epilogue', '')}\n\n"
+        f"ANSWER B (Knowledge-Graph RAG, {len(bullets_b)} bullets):\n"
+        f"Prologue: {answer_b.get('prologue', '')}\n"
+        f"Bullets:\n" + "\n".join(f"  {i+1}. {b}" for i, b in enumerate(bullets_b)) + "\n"
+        f"Epilogue: {answer_b.get('epilogue', '')}\n\n"
+        f"Merge into ONE superior answer with approximately {bullet_count} bullets. "
+        f"Follow the fusion rules. Return the JSON."
+    )
+
+    client = get_claude_client()
+    response = await client.request(
+        messages=[{"role": "user", "content": prompt}],
+        system=FUSION_SYSTEM,
+        model=settings.haiku_model,
+        max_tokens=6144,
+        task_type="answer_fusion",
+        subject=subject,
+        request_id=f"fuse_{uuid.uuid4().hex[:8]}",
+    )
+
+    return response
+
+
+# ── Batch Generation (Main Entry Point) ───────────────────────────
 
 async def generate_answers(
     mapping_ids: list[str],
     preset: str = "custom",
     custom_bullet_count: int = None,
     custom_style: str = None,
+    mode: str = "auto",
     progress_callback=None,
 ) -> dict:
     """Generate answers for up to 5 matched questions.
@@ -343,6 +604,7 @@ async def generate_answers(
         preset: LAQ, SAQ, VSAQ, or custom
         custom_bullet_count: Number of bullets (for custom preset)
         custom_style: detailed or precise (for custom preset)
+        mode: "auto" | "graph_only" | "hybrid"
         progress_callback: Optional async callback for progress
 
     Returns:
@@ -358,7 +620,8 @@ async def generate_answers(
             await progress_callback("answer_gen", current, total, msg)
         logger.info(msg)
 
-    await notify(f"Generating answers for {len(mapping_ids)} questions ({preset}, {bullet_count} bullets, {bullet_style})")
+    mode_label = {"auto": "Auto (merged)", "graph_only": "GraphRAG Only", "hybrid": "Hybrid Fusion"}
+    await notify(f"Generating answers for {len(mapping_ids)} questions ({preset}, {bullet_count} bullets, {bullet_style}, mode={mode_label.get(mode, mode)})")
 
     # ── Phase 1: Retrieve context for each question ──
     items = []
@@ -386,13 +649,81 @@ async def generate_answers(
             for ex in existing:
                 await database.execute("DELETE FROM answers WHERE id = ?", (ex["id"],))
 
-        # Retrieve textbook context
-        chunks = await _retrieve_context(q_text, chapter_id, subject)
-        chunk_texts = [c["text"] for c in chunks]
-        chunk_ids = [c["id"] for c in chunks]
-        source_pages = _extract_pages(chunks, textbook_name)
+        # ── Retrieve context based on mode ──
+        retrieval_meta = {
+            "mode": mode,
+            "vector_chunks_used": 0,
+            "graph_chunks_used": 0,
+            "overlap_count": 0,
+            "concepts_matched": [],
+            "relation_context": [],
+            "fusion_applied": False,
+            "bullet_provenance": [],
+            "fusion_notes": "",
+        }
 
-        # Find relevant images from source pages
+        if mode == "auto":
+            # Existing merged behavior
+            chunks = await _retrieve_context(q_text, chapter_id, subject)
+            chunk_texts = [c["text"] for c in chunks]
+            chunk_ids = [c["id"] for c in chunks]
+            vector_count = sum(1 for c in chunks if c.get("metadata", {}).get("source") != "graph")
+            graph_count = sum(1 for c in chunks if c.get("metadata", {}).get("source") == "graph")
+            retrieval_meta["vector_chunks_used"] = vector_count
+            retrieval_meta["graph_chunks_used"] = graph_count
+
+            # Get graph context for metadata
+            try:
+                extended = await get_extended_concepts_for_question(q_text, subject, limit=6)
+                retrieval_meta["concepts_matched"] = extended.get("concept_names", [])[:10]
+                retrieval_meta["relation_context"] = extended.get("relation_context", [])[:10]
+            except Exception:
+                pass
+
+            source_pages = _extract_pages(chunks, textbook_name)
+
+        elif mode == "graph_only":
+            # Pure GraphRAG: zero vector search
+            graph_chunks, graph_meta = await _retrieve_graph_context(q_text, subject, n_chunks=10)
+            chunks = graph_chunks
+            chunk_texts = [c["text"] for c in chunks]
+            chunk_ids = [c["id"] for c in chunks]
+            retrieval_meta["graph_chunks_used"] = graph_meta["chunks_retrieved"]
+            retrieval_meta["concepts_matched"] = graph_meta.get("concepts_matched", [])[:10]
+            retrieval_meta["relation_context"] = graph_meta.get("relation_context", [])[:10]
+            retrieval_meta["direct_concepts"] = graph_meta.get("direct_concepts", 0)
+            retrieval_meta["neighbor_concepts"] = graph_meta.get("neighbor_concepts", 0)
+            source_pages = _extract_pages(chunks, textbook_name)
+
+        elif mode == "hybrid":
+            # Dual-path: retrieve both independently
+            vector_chunks, vector_meta = await _retrieve_vector_context(q_text, chapter_id, subject, n_chunks=5)
+            graph_chunks, graph_meta = await _retrieve_graph_context(q_text, subject, n_chunks=8)
+
+            # Count overlap
+            vector_ids = {c["id"] for c in vector_chunks}
+            graph_ids = {c["id"] for c in graph_chunks}
+            overlap = vector_ids & graph_ids
+
+            chunks = vector_chunks + [c for c in graph_chunks if c["id"] not in vector_ids]
+            chunk_texts = [c["text"] for c in chunks]
+            chunk_ids = [c["id"] for c in chunks]
+
+            retrieval_meta["vector_chunks_used"] = vector_meta["chunks_retrieved"]
+            retrieval_meta["graph_chunks_used"] = graph_meta["chunks_retrieved"]
+            retrieval_meta["overlap_count"] = len(overlap)
+            retrieval_meta["concepts_matched"] = graph_meta.get("concepts_matched", [])[:10]
+            retrieval_meta["relation_context"] = graph_meta.get("relation_context", [])[:10]
+            retrieval_meta["fusion_applied"] = True
+            source_pages = _extract_pages(chunks, textbook_name)
+        else:
+            # Fallback to auto
+            chunks = await _retrieve_context(q_text, chapter_id, subject)
+            chunk_texts = [c["text"] for c in chunks]
+            chunk_ids = [c["id"] for c in chunks]
+            source_pages = _extract_pages(chunks, textbook_name)
+
+        # Find relevant images
         images = []
         if textbook_id:
             try:
@@ -402,6 +733,21 @@ async def generate_answers(
 
         context_text = "\n\n---\n\n".join(chunk_texts) if chunk_texts else "No textbook content available."
 
+        # Build graph context string for prompt injection
+        graph_context_str = ""
+        if retrieval_meta["relation_context"]:
+            graph_context_str = "\n".join(f"- {rc}" for rc in retrieval_meta["relation_context"][:15])
+
+        # Confidence score
+        confidence = _compute_confidence(
+            retrieval_meta["vector_chunks_used"],
+            retrieval_meta["graph_chunks_used"],
+            retrieval_meta.get("overlap_count", 0),
+            len(retrieval_meta.get("concepts_matched", [])),
+            len(retrieval_meta.get("relation_context", [])),
+        )
+        retrieval_meta["confidence_score"] = confidence
+
         items.append({
             "mapping_id": mid,
             "question_text": q_text,
@@ -410,54 +756,116 @@ async def generate_answers(
             "textbook_name": textbook_name,
             "subject": subject,
             "context": context_text,
+            "graph_context": graph_context_str,
             "chunk_ids": chunk_ids,
             "source_pages": source_pages,
             "images": images,
+            "retrieval_meta": retrieval_meta,
+            # For hybrid mode: keep separate chunks for dual Claude calls
+            "vector_context": "\n\n---\n\n".join([c["text"] for c in vector_chunks]) if mode == "hybrid" else "",
+            "graph_only_context": "\n\n---\n\n".join([c["text"] for c in graph_chunks]) if mode == "hybrid" else "",
         })
 
     if not items:
         return {"error": "No valid mappings found", "generated": 0}
 
-    await notify(f"Phase 1 done: Retrieved context for {len(items)} questions", 1, 3)
+    await notify(f"Phase 1 done: Retrieved context for {len(items)} questions (mode={mode})", 1, 4 if mode == "hybrid" else 3)
 
-    # ── Phase 2: Build prompt and call Claude ──
-    prompt_parts = []
-    for i, item in enumerate(items):
-        prompt_parts.append(
-            f"QUESTION {i} ({preset}, {bullet_count} {bullet_style} bullets):\n"
-            f"{item['question_text']}\n\n"
-            f"TEXTBOOK SOURCE (Chapter: {item['chapter_name']}):\n"
-            f"{item['context']}\n"
-        )
+    # ── Phase 2: Generate answers ──
 
-    full_prompt = "\n\n{'='*60}\n\n".join(prompt_parts)
-    full_prompt += (
-        f"\n\nGenerate answers for ALL {len(items)} questions above. "
-        f"Each answer must have exactly {bullet_count} {bullet_style} bullet points "
-        f"(unless source material is insufficient). Return the JSON."
-    )
+    if mode == "hybrid":
+        # ── Hybrid: dual-path generation + fusion ──
+        await notify("Phase 2a: Generating Answer A (vector-only)...", 2, 4)
 
-    await notify("Phase 2: Sending to Claude for answer generation...", 2, 3)
+        # Answer A: vector-only
+        items_a = [{
+            **item,
+            "context": item["vector_context"] or item["context"],
+            "graph_context": "",
+        } for item in items]
 
-    try:
-        client = get_claude_client()
-        response = await client.request(
-            messages=[{"role": "user", "content": full_prompt}],
-            system=ANSWER_SYSTEM,
-            model=settings.haiku_model,
-            max_tokens=8192,
-            task_type="answer_generation",
-            subject=items[0]["subject"],
-            request_id=f"ans_{uuid.uuid4().hex[:8]}",
-        )
+        try:
+            answers_a = await _call_claude_for_answer(
+                items_a, preset, bullet_count, bullet_style,
+                ANSWER_SYSTEM, items[0]["subject"],
+            )
+        except Exception as e:
+            logger.error(f"Vector answer generation failed: {e}")
+            answers_a = [None] * len(items)
 
-        answers_list = response.get("answers", [])
-    except Exception as e:
-        logger.error(f"Answer generation failed: {e}")
-        return {"error": str(e), "generated": 0}
+        await notify("Phase 2b: Generating Answer B (graph-only)...", 3, 4)
+
+        # Answer B: graph-only
+        items_b = [{
+            **item,
+            "context": item["graph_only_context"] or item["context"],
+        } for item in items]
+
+        try:
+            answers_b = await _call_claude_for_answer(
+                items_b, preset, bullet_count, bullet_style,
+                ANSWER_SYSTEM_WITH_GRAPH, items[0]["subject"],
+                extra_context="graph",
+            )
+        except Exception as e:
+            logger.error(f"Graph answer generation failed: {e}")
+            answers_b = [None] * len(items)
+
+        await notify("Phase 2c: Running fusion pass...", 3, 4)
+
+        # Fusion pass for each question
+        fused_answers = []
+        for i, item in enumerate(items):
+            ans_a = answers_a[i] if i < len(answers_a) else None
+            ans_b = answers_b[i] if i < len(answers_b) else None
+
+            if ans_a and ans_b and ans_a.get("bullets") and ans_b.get("bullets"):
+                try:
+                    fused = await _fuse_answers(
+                        item["question_text"], ans_a, ans_b,
+                        bullet_count, item["subject"],
+                    )
+                    fused_answers.append(fused)
+                    # Update provenance in retrieval metadata
+                    item["retrieval_meta"]["bullet_provenance"] = fused.get("bullet_provenance", [])
+                    item["retrieval_meta"]["fusion_notes"] = fused.get("fusion_notes", "")
+                except Exception as e:
+                    logger.warning(f"Fusion failed for question {i}, falling back to Answer A: {e}")
+                    fused_answers.append(ans_a)
+                    item["retrieval_meta"]["fusion_applied"] = False
+            elif ans_a and ans_a.get("bullets"):
+                fused_answers.append(ans_a)
+                item["retrieval_meta"]["fusion_applied"] = False
+                item["retrieval_meta"]["fusion_notes"] = "Fusion skipped: graph answer empty"
+            elif ans_b and ans_b.get("bullets"):
+                fused_answers.append(ans_b)
+                item["retrieval_meta"]["fusion_applied"] = False
+                item["retrieval_meta"]["fusion_notes"] = "Fusion skipped: vector answer empty"
+            else:
+                fused_answers.append(None)
+
+        answers_list = fused_answers
+
+    else:
+        # ── Auto or graph_only: single Claude call ──
+        await notify("Phase 2: Sending to Claude for answer generation...", 2, 3)
+
+        # Choose system prompt based on whether we have graph context
+        system = ANSWER_SYSTEM_WITH_GRAPH if any(item.get("graph_context") for item in items) else ANSWER_SYSTEM
+        extra = "graph" if any(item.get("graph_context") for item in items) else ""
+
+        try:
+            answers_list = await _call_claude_for_answer(
+                items, preset, bullet_count, bullet_style,
+                system, items[0]["subject"], extra_context=extra,
+            )
+        except Exception as e:
+            logger.error(f"Answer generation failed: {e}")
+            return {"error": str(e), "generated": 0}
 
     # ── Phase 3: Store results ──
-    await notify("Phase 3: Storing generated answers...", 3, 3)
+    phase_num = 4 if mode == "hybrid" else 3
+    await notify(f"Phase {phase_num}: Storing generated answers...", phase_num, phase_num)
     generated = 0
     errors = 0
 
@@ -492,6 +900,8 @@ async def generate_answers(
             "textbook_name": item["textbook_name"],
             "model_used": settings.haiku_model,
             "status": "generated",
+            "retrieval_mode": mode,
+            "retrieval_metadata": json.dumps(item["retrieval_meta"]),
         })
         generated += 1
 
@@ -502,9 +912,10 @@ async def generate_answers(
         "preset": preset,
         "bullet_count": bullet_count,
         "bullet_style": bullet_style,
+        "mode": mode,
     }
 
-    await notify(f"Done: {generated}/{len(items)} answers generated", 3, 3)
+    await notify(f"Done: {generated}/{len(items)} answers generated (mode={mode})", phase_num, phase_num)
     return result
 
 
@@ -513,6 +924,7 @@ async def regenerate_answer(
     preset: str = None,
     custom_bullet_count: int = None,
     custom_style: str = None,
+    mode: str = None,
 ) -> dict:
     """Regenerate a single answer with different parameters."""
     answer = await database.fetch_one("answers", answer_id)
@@ -525,5 +937,6 @@ async def regenerate_answer(
         preset=preset or answer.get("preset", "custom"),
         custom_bullet_count=custom_bullet_count,
         custom_style=custom_style,
+        mode=mode or answer.get("retrieval_mode", "auto"),
     )
     return result

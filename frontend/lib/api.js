@@ -235,12 +235,13 @@ export async function getAnswerPresets() {
   return fetchAPI("/answers/presets");
 }
 
-export async function generateAnswers(mappingIds, preset, customBulletCount, customStyle) {
+export async function generateAnswers(mappingIds, preset, customBulletCount, customStyle, mode = "auto") {
   const formData = new FormData();
   formData.append("mapping_ids", mappingIds.join(","));
   formData.append("preset", preset);
   if (customBulletCount) formData.append("custom_bullet_count", customBulletCount);
   if (customStyle) formData.append("custom_style", customStyle);
+  formData.append("mode", mode);
 
   const res = await fetch(`${API_BASE}/answers/generate`, {
     method: "POST",

@@ -1164,3 +1164,64 @@ async def get_related_chunk_ids(concept_ids: list[str], subject: str) -> list[st
                 pass
 
     return all_chunk_ids
+
+
+async def get_extended_concepts_for_question(
+    question_text: str, subject: str, limit: int = 10
+) -> dict:
+    """Get concepts + their 1-hop neighbors with relation context for GraphRAG.
+
+    Returns:
+        {
+            "concepts": [...],           # All matched + neighbor concepts
+            "relation_context": [...],   # Human-readable relation chains
+            "direct_count": int,
+            "neighbor_count": int,
+        }
+    """
+    direct_concepts = await get_concepts_for_question(question_text, subject, limit=8)
+
+    neighbor_concepts = []
+    relation_context = []
+    seen = {c["id"] for c in direct_concepts}
+
+    for concept in direct_concepts:
+        # Outgoing relations
+        out_rels = await database.fetch_all(
+            "concept_relations", "source_id = ?", (concept["id"],)
+        )
+        for rel in out_rels[:6]:  # Cap per-concept to avoid explosion
+            if rel["target_id"] not in seen:
+                target = await database.fetch_one("concepts", rel["target_id"])
+                if target and target.get("subject") == subject:
+                    neighbor_concepts.append(target)
+                    seen.add(rel["target_id"])
+                    relation_context.append(
+                        f"{concept['name']} --[{rel['relation_type']}]--> {target['name']}"
+                    )
+
+        # Incoming relations
+        in_rels = await database.fetch_all(
+            "concept_relations", "target_id = ?", (concept["id"],)
+        )
+        for rel in in_rels[:6]:
+            if rel["source_id"] not in seen:
+                source = await database.fetch_one("concepts", rel["source_id"])
+                if source and source.get("subject") == subject:
+                    neighbor_concepts.append(source)
+                    seen.add(rel["source_id"])
+                    relation_context.append(
+                        f"{source['name']} --[{rel['relation_type']}]--> {concept['name']}"
+                    )
+
+    all_concepts = direct_concepts + neighbor_concepts[:limit]
+    all_concept_ids = [c["id"] for c in all_concepts]
+
+    return {
+        "concepts": all_concepts,
+        "concept_ids": all_concept_ids,
+        "concept_names": [c["name"] for c in all_concepts],
+        "relation_context": relation_context,
+        "direct_count": len(direct_concepts),
+        "neighbor_count": min(len(neighbor_concepts), limit),
+    }

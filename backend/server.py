@@ -835,13 +835,19 @@ async def api_generate_answers(
     preset: str = Form("custom"),
     custom_bullet_count: int = Form(None),
     custom_style: str = Form(None),
+    mode: str = Form("auto"),
 ):
-    """Generate answers for selected questions (max 5)."""
+    """Generate answers for selected questions (max 5).
+
+    mode: 'auto' (merged vector+graph), 'graph_only' (pure GraphRAG), 'hybrid' (dual-path + fusion)
+    """
     ids = [mid.strip() for mid in mapping_ids.split(",") if mid.strip()]
     if not ids:
         raise HTTPException(400, "No mapping IDs provided")
     if len(ids) > 5:
         raise HTTPException(400, "Maximum 5 questions per batch")
+    if mode not in ("auto", "graph_only", "hybrid"):
+        mode = "auto"
 
     task_id = f"ans_{uuid.uuid4().hex[:8]}"
 
@@ -857,6 +863,7 @@ async def api_generate_answers(
                 preset=preset,
                 custom_bullet_count=custom_bullet_count,
                 custom_style=custom_style,
+                mode=mode,
                 progress_callback=progress_cb,
             )
             await send_progress(task_id, "done", 1, 1, json.dumps(result))
@@ -865,7 +872,7 @@ async def api_generate_answers(
             await send_progress(task_id, "error", 0, 0, str(e))
 
     background_tasks.add_task(run_generation)
-    return {"task_id": task_id, "status": "started", "count": len(ids)}
+    return {"task_id": task_id, "status": "started", "count": len(ids), "mode": mode}
 
 
 @app.get("/api/answers")
@@ -895,6 +902,13 @@ async def get_answers(
 
     answers = []
     for r in rows:
+        meta_raw = r.get("retrieval_metadata")
+        retrieval_metadata = None
+        if meta_raw and isinstance(meta_raw, str):
+            try:
+                retrieval_metadata = json.loads(meta_raw)
+            except json.JSONDecodeError:
+                retrieval_metadata = None
         answers.append({
             "id": r["id"],
             "mapping_id": r["mapping_id"],
@@ -912,6 +926,8 @@ async def get_answers(
             "generated_at": r.get("generated_at", ""),
             "model_used": r.get("model_used", ""),
             "status": r.get("status", "generated"),
+            "retrieval_mode": r.get("retrieval_mode", "auto"),
+            "retrieval_metadata": retrieval_metadata,
         })
     return answers
 
@@ -949,6 +965,13 @@ async def get_answer_for_mapping(mapping_id: str):
     if not rows:
         return None
     r = rows[0]
+    meta_raw = r.get("retrieval_metadata")
+    retrieval_metadata = None
+    if meta_raw and isinstance(meta_raw, str):
+        try:
+            retrieval_metadata = json.loads(meta_raw)
+        except json.JSONDecodeError:
+            retrieval_metadata = None
     return {
         "id": r["id"],
         "mapping_id": r["mapping_id"],
@@ -965,6 +988,8 @@ async def get_answer_for_mapping(mapping_id: str):
         "textbook_name": r.get("textbook_name", ""),
         "generated_at": r.get("generated_at", ""),
         "status": r.get("status", "generated"),
+        "retrieval_mode": r.get("retrieval_mode", "auto"),
+        "retrieval_metadata": retrieval_metadata,
     }
 
 
