@@ -476,28 +476,20 @@ async def _find_relevant_images(
 
 def _compute_confidence(
     vector_chunks: int, graph_chunks: int, overlap_count: int,
-    concepts_matched: int, relations_count: int
+    concepts_matched: int, relations_count: int,
+    avg_similarity: float = 0.0
 ) -> int:
     """Compute an answer confidence score (0-100) based on retrieval quality."""
     score = 0
 
-    # Base: did we find ANY chunks?
-    if vector_chunks > 0:
-        score += 20
-    if graph_chunks > 0:
-        score += 20
-
-    # Overlap bonus: if vector and graph found the same chunks, high confidence
-    if overlap_count > 0:
-        score += min(overlap_count * 8, 24)
-
-    # Concepts matched
-    if concepts_matched > 0:
-        score += min(concepts_matched * 5, 20)
-
-    # Relations used (structural grounding)
-    if relations_count > 0:
-        score += min(relations_count * 3, 16)
+    # Graded vector contribution (not binary)
+    score += min(vector_chunks * 6, 24)        # 0-24 based on chunk count
+    score += min(graph_chunks * 5, 20)          # 0-20
+    score += min(overlap_count * 10, 20)        # 0-20 (overlap is golden)
+    score += min(concepts_matched * 4, 16)      # 0-16
+    score += min(relations_count * 3, 12)       # 0-12
+    # Similarity quality bonus
+    score += min(int(avg_similarity * 12), 8)   # 0-8 based on avg similarity
 
     return min(score, 100)
 
@@ -662,24 +654,27 @@ async def generate_answers(
             "fusion_notes": "",
         }
 
+        vector_chunks = []
+        graph_chunks = []
+
         if mode == "auto":
-            # Existing merged behavior
-            chunks = await _retrieve_context(q_text, chapter_id, subject)
+            # Explicit dual retrieval for auto mode
+            vector_chunks, vector_meta = await _retrieve_vector_context(q_text, chapter_id, subject, n_chunks=5)
+            graph_chunks, graph_meta = await _retrieve_graph_context(q_text, subject, n_chunks=8)
+
+            vector_ids = {c["id"] for c in vector_chunks}
+            graph_ids = {c["id"] for c in graph_chunks}
+            overlap = vector_ids & graph_ids
+
+            chunks = vector_chunks + [c for c in graph_chunks if c["id"] not in vector_ids]
             chunk_texts = [c["text"] for c in chunks]
             chunk_ids = [c["id"] for c in chunks]
-            vector_count = sum(1 for c in chunks if c.get("metadata", {}).get("source") != "graph")
-            graph_count = sum(1 for c in chunks if c.get("metadata", {}).get("source") == "graph")
-            retrieval_meta["vector_chunks_used"] = vector_count
-            retrieval_meta["graph_chunks_used"] = graph_count
 
-            # Get graph context for metadata
-            try:
-                extended = await get_extended_concepts_for_question(q_text, subject, limit=6)
-                retrieval_meta["concepts_matched"] = extended.get("concept_names", [])[:10]
-                retrieval_meta["relation_context"] = extended.get("relation_context", [])[:10]
-            except Exception:
-                pass
-
+            retrieval_meta["vector_chunks_used"] = vector_meta["chunks_retrieved"]
+            retrieval_meta["graph_chunks_used"] = graph_meta["chunks_retrieved"]
+            retrieval_meta["overlap_count"] = len(overlap)
+            retrieval_meta["concepts_matched"] = graph_meta.get("concepts_matched", [])[:10]
+            retrieval_meta["relation_context"] = graph_meta.get("relation_context", [])[:10]
             source_pages = _extract_pages(chunks, textbook_name)
 
         elif mode == "graph_only":
@@ -718,7 +713,11 @@ async def generate_answers(
             source_pages = _extract_pages(chunks, textbook_name)
         else:
             # Fallback to auto
-            chunks = await _retrieve_context(q_text, chapter_id, subject)
+            vector_chunks, vector_meta = await _retrieve_vector_context(q_text, chapter_id, subject, n_chunks=5)
+            graph_chunks, graph_meta = await _retrieve_graph_context(q_text, subject, n_chunks=8)
+            
+            vector_ids = {c["id"] for c in vector_chunks}
+            chunks = vector_chunks + [c for c in graph_chunks if c["id"] not in vector_ids]
             chunk_texts = [c["text"] for c in chunks]
             chunk_ids = [c["id"] for c in chunks]
             source_pages = _extract_pages(chunks, textbook_name)
@@ -738,6 +737,10 @@ async def generate_answers(
         if retrieval_meta["relation_context"]:
             graph_context_str = "\n".join(f"- {rc}" for rc in retrieval_meta["relation_context"][:15])
 
+        # Compute avg similarity of vector chunks
+        v_sims = [c.get("similarity", 0.0) for c in vector_chunks if c.get("similarity") is not None]
+        avg_similarity = sum(v_sims) / len(v_sims) if v_sims else 0.0
+
         # Confidence score
         confidence = _compute_confidence(
             retrieval_meta["vector_chunks_used"],
@@ -745,6 +748,7 @@ async def generate_answers(
             retrieval_meta.get("overlap_count", 0),
             len(retrieval_meta.get("concepts_matched", [])),
             len(retrieval_meta.get("relation_context", [])),
+            avg_similarity=avg_similarity
         )
         retrieval_meta["confidence_score"] = confidence
 

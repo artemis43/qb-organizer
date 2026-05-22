@@ -1,21 +1,33 @@
 "use client";
 import { useState, useEffect } from "react";
-import { getSettings, updateSettings, fullReset, deleteAllMappings } from "../../lib/api";
+import { getSettings, updateSettings, getSystemInfo, fullReset, deleteAllMappings } from "../../lib/api";
 
 export default function SettingsPage() {
   const [settings, setSettings] = useState(null);
+  const [sysInfo, setSysInfo] = useState(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState(null);
-  const [openSections, setOpenSections] = useState({ api: true, matching: false, processing: false, cost: true, danger: false });
+  const [openSections, setOpenSections] = useState({
+    api: true,
+    matching: false,
+    processing: false,
+    answerGen: false,
+    kg: false,
+    exportDeploy: false,
+    sysinfo: true,
+    cost: false,
+    danger: false
+  });
   const [form, setForm] = useState({});
 
   useEffect(() => { loadSettings(); }, []);
 
   async function loadSettings() {
     try {
-      const s = await getSettings();
+      const [s, sys] = await Promise.all([getSettings(), getSystemInfo()]);
       setSettings(s);
+      setSysInfo(sys);
       setForm({
         api_key: s.api_key_masked,
         haiku_model: s.haiku_model,
@@ -26,9 +38,19 @@ export default function SettingsPage() {
         chunk_size: s.chunk_size,
         chunk_overlap: s.chunk_overlap,
         embedding_model: s.embedding_model,
+        
+        default_answer_mode: s.default_answer_mode || "auto",
+        default_answer_preset: s.default_answer_preset || "SAQ",
+        answer_temperature: s.answer_temperature ?? 0.3,
+        kg_extraction_model: s.kg_extraction_model || "haiku",
+        kg_max_concepts_per_batch: s.kg_max_concepts_per_batch ?? 50,
+        kg_enable_relation_extraction: s.kg_enable_relation_extraction ?? true,
+        kg_default_limit: s.kg_default_limit ?? 150,
+        fs_collection_prefix: s.fs_collection_prefix || "",
+        imagekit_folder: s.imagekit_folder || "/qb-organizer",
       });
     } catch (e) {
-      showToast("Failed to load settings", "error");
+      showToast("Failed to load settings: " + e.message, "error");
     }
     setLoading(false);
   }
@@ -68,6 +90,7 @@ export default function SettingsPage() {
       if (type === "full") await fullReset();
       else await deleteAllMappings();
       showToast(type === "full" ? "All data reset" : "Mappings cleared", "success");
+      await loadSettings();
     } catch (e) {
       showToast("Reset failed: " + e.message, "error");
     }
@@ -77,13 +100,14 @@ export default function SettingsPage() {
 
   const cost = settings?.cost || {};
   const budgetPct = cost.budget_limit ? ((cost.total_spent / cost.budget_limit) * 100).toFixed(1) : 0;
+  const disk = sysInfo?.disk_usage || { total_gb: 0, used_gb: 0, free_gb: 0, pct_used: 0 };
 
   return (
     <div>
       <div className="page-header">
         <div>
           <h1 className="page-title">⚙️ Settings</h1>
-          <p className="page-subtitle">Configure matching engine, API, and processing parameters</p>
+          <p className="page-subtitle">Configure matching engine, API, processing, answers, and visual settings</p>
         </div>
         <button className="btn btn-primary" onClick={saveSettings} disabled={saving}>
           {saving ? "Saving..." : "💾 Save Changes"}
@@ -133,6 +157,120 @@ export default function SettingsPage() {
         <SettingsField label="Chunk Overlap" hint="Overlap between consecutive chunks">
           <input className="input" type="number" step="25" value={form.chunk_overlap || ""} onChange={e => updateField("chunk_overlap", e.target.value)} />
         </SettingsField>
+      </Section>
+
+      {/* Answer Generation */}
+      <Section title="🤖 Answer Generation" sKey="answerGen" open={openSections.answerGen} toggle={toggleSection}>
+        <SettingsField label="Default Answer Mode" hint="Default retrieval strategy to run">
+          <select className="select" value={form.default_answer_mode} onChange={e => updateField("default_answer_mode", e.target.value)}>
+            <option value="auto">Auto (Merged context)</option>
+            <option value="graph_only">GraphRAG Only (Pure Concept relationships)</option>
+            <option value="hybrid">Hybrid Fusion (Dual path merged answers)</option>
+          </select>
+        </SettingsField>
+        <SettingsField label="Default Answer Preset" hint="Target template format and length constraints">
+          <select className="select" value={form.default_answer_preset} onChange={e => updateField("default_answer_preset", e.target.value)}>
+            <option value="LAQ">LAQ (Long Answer, 15-20 bullets)</option>
+            <option value="SAQ">SAQ (Short Answer, 8-12 bullets)</option>
+            <option value="VSAQ">VSAQ (Very Short Answer, 7-8 bullets)</option>
+          </select>
+        </SettingsField>
+        <SettingsField label="Answer Temperature" hint="Generation creativity/randomness (0.0 = deterministic)">
+          <input className="input" type="number" step="0.1" min="0" max="1.2" value={form.answer_temperature} onChange={e => updateField("answer_temperature", parseFloat(e.target.value) || 0.3)} />
+        </SettingsField>
+      </Section>
+
+      {/* Knowledge Graph */}
+      <Section title="🕸️ Knowledge Graph" sKey="kg" open={openSections.kg} toggle={toggleSection}>
+        <SettingsField label="KG Extraction Model" hint="AI model to build the concept maps (e.g. haiku, sonnet)">
+          <input className="input" value={form.kg_extraction_model} onChange={e => updateField("kg_extraction_model", e.target.value)} />
+        </SettingsField>
+        <SettingsField label="Max Concepts per Batch" hint="Chunk sizes when building concepts">
+          <input className="input" type="number" step="5" min="5" value={form.kg_max_concepts_per_batch} onChange={e => updateField("kg_max_concepts_per_batch", parseInt(e.target.value) || 50)} />
+        </SettingsField>
+        <SettingsField label="Relation Extraction" hint="Extract chains of relationships between medical concepts">
+          <select className="select" value={String(form.kg_enable_relation_extraction)} onChange={e => updateField("kg_enable_relation_extraction", e.target.value === "true")}>
+            <option value="true">Enabled</option>
+            <option value="false">Disabled</option>
+          </select>
+        </SettingsField>
+        <SettingsField label="Default Concept Limit" hint="Default number of concepts to render in visual graph view">
+          <input className="input" type="number" step="50" min="50" max="2000" value={form.kg_default_limit} onChange={e => updateField("kg_default_limit", parseInt(e.target.value) || 150)} />
+        </SettingsField>
+      </Section>
+
+      {/* Export & Deployment */}
+      <Section title="🚀 Export & Deployment" sKey="exportDeploy" open={openSections.exportDeploy} toggle={toggleSection}>
+        <SettingsField label="Firestore Collection Prefix" hint="Prefix for your Firestore collections (e.g. dev_)">
+          <input className="input" value={form.fs_collection_prefix} onChange={e => updateField("fs_collection_prefix", e.target.value)} placeholder="e.g. dev_" />
+        </SettingsField>
+        <SettingsField label="ImageKit Folder Path" hint="Target folder path for uploaded diagrams in ImageKit">
+          <input className="input" value={form.imagekit_folder} onChange={e => updateField("imagekit_folder", e.target.value)} placeholder="/qb-organizer" />
+        </SettingsField>
+      </Section>
+
+      {/* System Info & Metrics */}
+      <Section title="🖥️ System Info & Metrics" sKey="sysinfo" open={openSections.sysinfo} toggle={toggleSection}>
+        {sysInfo ? (
+          <div>
+            <div className="grid-4" style={{ marginBottom: 20 }}>
+              <div className="stat-card">
+                <div className="stat-value" style={{ fontSize: 20, color: "var(--accent)" }}>{sysInfo.python_version}</div>
+                <div className="stat-label">Python Version</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-value" style={{ fontSize: 20 }}>{sysInfo.database_size_mb} MB</div>
+                <div className="stat-label">SQLite File Size</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-value" style={{ fontSize: 20, color: "var(--success)" }}>{sysInfo.vector_chunks}</div>
+                <div className="stat-label">Vector Chunks</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-value" style={{ fontSize: 20 }}>{disk.free_gb} GB</div>
+                <div className="stat-label">Disk Storage Free</div>
+              </div>
+            </div>
+
+            {/* Storage Progress Bar */}
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 4, fontWeight: 600, color: "var(--text-dim)" }}>
+                <span>DISK SPACE USAGE</span>
+                <span>{disk.used_gb} GB / {disk.total_gb} GB ({disk.pct_used}%)</span>
+              </div>
+              <div className="progress-bar-container">
+                <div className="progress-bar-fill" style={{ width: `${disk.pct_used}%`, background: disk.pct_used > 85 ? "var(--danger)" : "var(--accent)" }} />
+              </div>
+            </div>
+
+            {/* Packages */}
+            <div className="input-label" style={{ marginBottom: 8 }}>Installed Python Packages</div>
+            <div className="table-container">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Package Name</th>
+                    <th>Installed Version</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.entries(sysInfo.package_versions || {}).map(([name, ver]) => (
+                    <tr key={name}>
+                      <td style={{ fontFamily: "var(--mono)", fontSize: 12 }}>{name}</td>
+                      <td style={{ fontFamily: "var(--mono)", fontSize: 12, color: ver === "not installed" ? "var(--danger)" : "var(--text-bright)" }}>
+                        {ver}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ) : (
+          <div style={{ padding: 12, textAlign: "center", fontStyle: "italic", color: "var(--text-dim)" }}>
+            Unable to load system info specifications.
+          </div>
+        )}
       </Section>
 
       {/* Cost Dashboard */}
@@ -199,7 +337,7 @@ export default function SettingsPage() {
 
 function Section({ title, sKey, open, toggle, children }) {
   return (
-    <div className="settings-section animate-in" style={{ animationDelay: `${["api","matching","processing","cost","danger"].indexOf(sKey) * 0.04}s` }}>
+    <div className="settings-section animate-in" style={{ animationDelay: `${["api","matching","processing","answerGen","kg","exportDeploy","sysinfo","cost","danger"].indexOf(sKey) * 0.04}s` }}>
       <div className={`settings-section-header ${open ? "open" : ""}`} onClick={() => toggle(sKey)}>
         <div className="settings-section-title">{title}</div>
         <span style={{ fontSize: 12, color: "var(--text-dim)", transition: "transform var(--t)", transform: open ? "rotate(180deg)" : "rotate(0)" }}>▼</span>

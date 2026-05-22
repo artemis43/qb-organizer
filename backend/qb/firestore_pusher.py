@@ -126,6 +126,7 @@ async def push_qb_to_firestore(
     mapping_ids: list[str] = None,
     upload_images: bool = True,
     progress_callback=None,
+    dry_run: bool = False,
 ) -> dict:
     """Push question bank questions + answers to Firestore.
 
@@ -200,14 +201,29 @@ async def push_qb_to_firestore(
     if existing_subj:
         subject_doc_id = existing_subj[0].id
     else:
-        _, doc_ref = subj_ref.add({"name": subject, "order": 0})
-        subject_doc_id = doc_ref.id
+        # Case-insensitive fallback lookup
+        all_subjects = subj_ref.get()
+        matched_doc = None
+        for s_doc in all_subjects:
+            s_name = s_doc.to_dict().get("name", "")
+            if s_name.lower().strip() == subject.lower().strip():
+                matched_doc = s_doc
+                break
+        if matched_doc:
+            subject_doc_id = matched_doc.id
+        else:
+            if dry_run:
+                subject_doc_id = "mock_subject_id"
+            else:
+                _, doc_ref = subj_ref.add({"name": subject.strip(), "order": 0})
+                subject_doc_id = doc_ref.id
 
     # ── Create/find chapters ──
     chapter_fs_map = {}  # local_chapter_id → firestore_chapter_id
     for ch in chapters:
+        ch_name_normalized = ch["name"].strip()
         ch_query = db.collection("chapters").where(
-            "name", "==", ch["name"]
+            "name", "==", ch_name_normalized
         ).where(
             "subjectId", "==", subject_doc_id
         ).limit(1).get()
@@ -215,12 +231,33 @@ async def push_qb_to_firestore(
         if ch_query:
             chapter_fs_map[ch["id"]] = ch_query[0].id
         else:
-            _, ch_ref = db.collection("chapters").add({
-                "name": ch["name"],
-                "subjectId": subject_doc_id,
-                "order": ch.get("chapter_number", 0),
-            })
-            chapter_fs_map[ch["id"]] = ch_ref.id
+            # Fallback 1: Name search alone (ignoring subjectId)
+            ch_query_fallback = db.collection("chapters").where(
+                "name", "==", ch_name_normalized
+            ).limit(1).get()
+            if ch_query_fallback:
+                chapter_fs_map[ch["id"]] = ch_query_fallback[0].id
+            else:
+                # Fallback 2: Case-insensitive search over all chapters
+                all_chapters = db.collection("chapters").get()
+                matched_ch = None
+                for c_doc in all_chapters:
+                    c_dict = c_doc.to_dict()
+                    if c_dict.get("name", "").lower().strip() == ch_name_normalized.lower():
+                        matched_ch = c_doc
+                        break
+                if matched_ch:
+                    chapter_fs_map[ch["id"]] = matched_ch.id
+                else:
+                    if dry_run:
+                        chapter_fs_map[ch["id"]] = f"mock_chapter_id_{ch['id']}"
+                    else:
+                        _, ch_ref = db.collection("chapters").add({
+                            "name": ch_name_normalized,
+                            "subjectId": subject_doc_id,
+                            "order": ch.get("chapter_number", 0),
+                        })
+                        chapter_fs_map[ch["id"]] = ch_ref.id
 
     # ── Push questions ──
     await notify(f"Pushing {len(mappings)} questions to Firestore...", 3, 4)
@@ -262,9 +299,10 @@ async def push_qb_to_firestore(
             if merge_tags:
                 try:
                     from firebase_admin import firestore as fs_module
-                    db.collection("questions").document(existing_q_id).update({
-                        "exams": fs_module.ArrayUnion(merge_tags)
-                    })
+                    if not dry_run:
+                        db.collection("questions").document(existing_q_id).update({
+                            "exams": fs_module.ArrayUnion(merge_tags)
+                        })
                 except Exception:
                     pass
             stats["duplicates_merged"] += 1
@@ -316,28 +354,43 @@ async def push_qb_to_firestore(
                     images_raw = []
 
                 if images_raw:
-                    from qb.imagekit_uploader import upload_answer_images
-                    image_urls = await upload_answer_images(images_raw, subject)
-                    image_urls = [u for u in image_urls if u]  # Filter empty
-                    stats["images_uploaded"] += len(image_urls)
+                    if dry_run:
+                        image_urls = [f"https://ik.imagekit.io/mock/{img.get('filename')}" for img in images_raw]
+                        stats["images_uploaded"] += len(images_raw)
+                    else:
+                        from qb.imagekit_uploader import upload_answer_images
+                        image_urls = await upload_answer_images(images_raw, subject)
+                        image_urls = [u for u in image_urls if u]  # Filter empty
+                        stats["images_uploaded"] += len(image_urls)
 
             # Push answer to Firestore
             answer_payload = {
                 "text": answer_text,
                 "imageUrls": image_urls,
+                "mappingId": m["id"],  # For exact deduplication
             }
 
-            # Check for existing answer in Firestore
+            # Check for existing answer in Firestore using mappingId
             existing_ans = db.collection("answers").where(
-                "text", "==", answer_text[:200]  # Partial match to avoid Firestore limits
+                "mappingId", "==", m["id"]
             ).limit(1).get()
+
+            # Fallback to partial text matching for legacy records
+            if not existing_ans:
+                existing_ans = db.collection("answers").where(
+                    "text", "==", answer_text[:200]
+                ).limit(1).get()
 
             if existing_ans:
                 answer_doc_id = existing_ans[0].id
-                db.collection("answers").document(answer_doc_id).update(answer_payload)
+                if not dry_run:
+                    db.collection("answers").document(answer_doc_id).update(answer_payload)
             else:
-                _, ans_ref = db.collection("answers").add(answer_payload)
-                answer_doc_id = ans_ref.id
+                if dry_run:
+                    answer_doc_id = f"mock_answer_id_{m['id']}"
+                else:
+                    _, ans_ref = db.collection("answers").add(answer_payload)
+                    answer_doc_id = ans_ref.id
 
             has_answer = True
             stats["answers"] += 1
@@ -365,16 +418,21 @@ async def push_qb_to_firestore(
 
             if existing_q:
                 q_doc_id = existing_q[0].id
-                db.collection("questions").document(q_doc_id).update(question_payload)
+                if not dry_run:
+                    db.collection("questions").document(q_doc_id).update(question_payload)
             else:
-                _, q_ref = db.collection("questions").add(question_payload)
-                q_doc_id = q_ref.id
+                if dry_run:
+                    q_doc_id = f"mock_question_id_{idx}"
+                else:
+                    _, q_ref = db.collection("questions").add(question_payload)
+                    q_doc_id = q_ref.id
 
             seen_texts[normalized] = q_doc_id
             stats["questions"] += 1
 
             # Mark as pushed in local DB
-            await database.update("mappings", m["id"], {"is_reviewed": 1})
+            if not dry_run:
+                await database.update("mappings", m["id"], {"is_reviewed": 1})
 
         except Exception as e:
             logger.error(f"Failed to push question {m['id']}: {e}")

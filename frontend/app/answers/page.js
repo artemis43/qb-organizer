@@ -2,7 +2,7 @@
 import { useState, useEffect } from "react";
 import {
   getMappings, getChapters, getAnswerForMapping, generateAnswers,
-  updateAnswer, deleteAnswer, connectProgress,
+  updateAnswer, deleteAnswer, connectProgress, getPapers, getTextbooks,
 } from "@/lib/api";
 
 const PRESETS = {
@@ -23,9 +23,57 @@ const PROVENANCE_STYLE = {
   F: { label: "Fused", color: "#34d399", bg: "rgba(52,211,153,0.12)" },
 };
 
+// Lightweight markdown renderer to parse bold (**bold**) and list formatting
+function renderMarkdown(text) {
+  if (!text) return null;
+  const lines = text.split("\n");
+  return lines.map((line, li) => {
+    let cleanLine = line.trim();
+    let isBullet = false;
+    let indent = 0;
+    
+    // Check indentation
+    const leadingSpaces = line.match(/^(\s*)/)[0].length;
+    if (leadingSpaces > 0) {
+      indent = Math.min(leadingSpaces * 8, 32);
+    }
+
+    if (cleanLine.startsWith("* ") || cleanLine.startsWith("- ")) {
+      cleanLine = cleanLine.substring(2);
+      isBullet = true;
+    } else if (cleanLine.match(/^\d+\.\s/)) {
+      cleanLine = cleanLine.replace(/^\d+\.\s/, "");
+      isBullet = true;
+    }
+
+    const parts = cleanLine.split(/(\*\*.*?\*\*)/g);
+    const content = parts.map((part, pi) => {
+      if (part.startsWith("**") && part.endsWith("**")) {
+        return <strong key={pi} style={{ color: "var(--text-bright)", fontWeight: 700 }}>{part.slice(2, -2)}</strong>;
+      }
+      return part;
+    });
+
+    return (
+      <div key={li} style={{ 
+        display: isBullet ? "flex" : "block", 
+        gap: 6,
+        marginLeft: indent + (isBullet ? 8 : 0), 
+        marginBottom: 4, 
+        lineHeight: 1.5 
+      }}>
+        {isBullet && <span style={{ color: "var(--accent)" }}>•</span>}
+        <span style={{ flex: 1 }}>{content}</span>
+      </div>
+    );
+  });
+}
+
 export default function AnswersPage() {
   const [mappings, setMappings] = useState([]);
   const [chapters, setChapters] = useState([]);
+  const [papers, setPapers] = useState([]);
+  const [textbooks, setTextbooks] = useState([]);
   const [answers, setAnswers] = useState({});
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState([]);
@@ -33,8 +81,13 @@ export default function AnswersPage() {
   const [customCount, setCustomCount] = useState(10);
   const [customStyle, setCustomStyle] = useState("detailed");
   const [mode, setMode] = useState("auto");
+  
+  // Advanced filters
+  const [filterSubject, setFilterSubject] = useState("");
   const [filterChapter, setFilterChapter] = useState("");
+  const [filterType, setFilterType] = useState("");
   const [filterStatus, setFilterStatus] = useState("all");
+  
   const [generating, setGenerating] = useState(false);
   const [genProgress, setGenProgress] = useState(null);
   const [viewAnswer, setViewAnswer] = useState(null);
@@ -45,14 +98,18 @@ export default function AnswersPage() {
   async function loadData() {
     setLoading(true);
     try {
-      const [m, ch] = await Promise.all([
+      const [m, ch, p, t] = await Promise.all([
         getMappings(null, null),
         getChapters(),
+        getPapers(),
+        getTextbooks(),
       ]);
       // Only show accepted/high-confidence mappings
       const eligible = m.filter(x => x.is_reviewed || x.confidence_level === "high");
       setMappings(eligible);
       setChapters(ch);
+      setPapers(p);
+      setTextbooks(t);
 
       // Load answers for all mappings
       const ansMap = {};
@@ -132,13 +189,33 @@ export default function AnswersPage() {
     } catch (err) { showToast("Delete failed", "error"); }
   }
 
+  // Lookup tables
+  const qpSubjectMap = {};
+  for (const paper of papers) {
+    qpSubjectMap[paper.id] = paper.subject;
+  }
+
+  const tbSubjectMap = {};
+  for (const tb of textbooks) {
+    tbSubjectMap[tb.id] = tb.subject;
+  }
+
   const filteredMappings = mappings.filter(m => {
+    const mSubj = qpSubjectMap[m.qp_id] || "";
+    if (filterSubject && mSubj !== filterSubject) return false;
     if (filterChapter && m.final_chapter_id !== filterChapter) return false;
+    if (filterType && m.question_type !== filterType) return false;
     if (filterStatus === "answered" && !answers[m.id]) return false;
     if (filterStatus === "unanswered" && answers[m.id]) return false;
     return true;
   });
 
+  const filteredChapters = chapters.filter(ch => {
+    if (!filterSubject) return true;
+    return tbSubjectMap[ch.textbook_id] === filterSubject;
+  });
+
+  const uniqueSubjects = Array.from(new Set(papers.map(p => p.subject).filter(Boolean)));
   const answeredCount = mappings.filter(m => answers[m.id]).length;
   const unansweredCount = mappings.length - answeredCount;
 
@@ -231,12 +308,35 @@ export default function AnswersPage() {
             </>
           )}
 
+          {/* Subject Filter */}
+          <div className="input-group" style={{ width: 160 }}>
+            <label className="input-label">Filter: Subject</label>
+            <select className="select" value={filterSubject} onChange={e => { setFilterSubject(e.target.value); setFilterChapter(""); }}>
+              <option value="">All Subjects</option>
+              {uniqueSubjects.map(sub => (
+                <option key={sub} value={sub}>{sub}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* Chapter Filter */}
           <div className="input-group" style={{ width: 180 }}>
             <label className="input-label">Filter: Chapter</label>
             <select className="select" value={filterChapter} onChange={e => setFilterChapter(e.target.value)}>
               <option value="">All Chapters</option>
-              {chapters.map(ch => (
+              {filteredChapters.map(ch => (
                 <option key={ch.id} value={ch.id}>Ch {ch.chapter_number}: {ch.name}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* Question Type Filter */}
+          <div className="input-group" style={{ width: 130 }}>
+            <label className="input-label">Filter: Type</label>
+            <select className="select" value={filterType} onChange={e => setFilterType(e.target.value)}>
+              <option value="">All Types</option>
+              {["LAQ", "SAQ", "VSAQ", "MCQ", "OTHER"].map(t => (
+                <option key={t} value={t}>{t}</option>
               ))}
             </select>
           </div>
@@ -310,111 +410,109 @@ export default function AnswersPage() {
         )}
       </div>
 
-      {/* Question List (grouped by chapter) */}
-      <div style={{ display: "flex", gap: 16 }}>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          {Object.entries(groupedByChapter).length === 0 ? (
-            <div className="empty-state">
-              <div className="empty-state-icon">✍️</div>
-              <div className="empty-state-title">No eligible questions</div>
-              <div className="empty-state-text">Run matching and review questions first</div>
-            </div>
-          ) : (
-            Object.entries(groupedByChapter).map(([chName, items]) => (
-              <div key={chName} style={{ marginBottom: 12 }}>
-                <div style={{ fontSize: 12, fontWeight: 700, color: "var(--accent)", marginBottom: 6, fontFamily: "var(--mono)", letterSpacing: 0.5 }}>
-                  📖 {chName} ({items.length})
-                </div>
-                {items.map((m) => {
-                  const ans = answers[m.id];
-                  const isSelected = selected.includes(m.id);
-                  const ansMode = ans?.retrieval_mode;
-                  const modeStyle = ansMode ? MODE_INFO[ansMode] : null;
-                  return (
-                    <div key={m.id} className="question-row" style={{
-                      display: "flex", gap: 10, alignItems: "flex-start",
-                      padding: "8px 12px", borderRadius: "var(--r)", marginBottom: 4,
-                      background: isSelected ? "rgba(77,127,255,0.08)" : "var(--surface)",
-                      border: `1px solid ${isSelected ? "rgba(77,127,255,0.3)" : "var(--border)"}`,
-                      cursor: "pointer", transition: "all var(--t)",
-                    }}
-                      onClick={() => ans ? setViewAnswer(ans) : toggleSelect(m.id)}
-                    >
-                      {/* Checkbox */}
-                      <div style={{ paddingTop: 2, flexShrink: 0 }}
-                        onClick={e => { e.stopPropagation(); toggleSelect(m.id); }}>
-                        <div style={{
-                          width: 18, height: 18, borderRadius: 4,
-                          border: `2px solid ${isSelected ? "var(--accent)" : "var(--border)"}`,
-                          background: isSelected ? "var(--accent)" : "transparent",
-                          display: "flex", alignItems: "center", justifyContent: "center",
-                          fontSize: 11, color: "#fff", transition: "all var(--t)",
-                        }}>
-                          {isSelected && "✓"}
-                        </div>
-                      </div>
-
-                      {/* Question text */}
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 13, color: "var(--text)", lineHeight: 1.4 }}>
-                          {m.question_text?.substring(0, 120)}{m.question_text?.length > 120 ? "..." : ""}
-                        </div>
-                        <div style={{ fontSize: 11, color: "var(--text-dim)", marginTop: 3, fontFamily: "var(--mono)" }}>
-                          {m.question_type} · {((m.confidence || 0) * 100).toFixed(0)}%
-                        </div>
-                      </div>
-
-                      {/* Answer status */}
-                      {ans ? (
-                        <div style={{ display: "flex", gap: 4, alignItems: "center", flexShrink: 0 }}>
-                          <span className="badge badge-high" style={{ fontSize: 10 }}>
-                            {ans.preset} · {ans.bullet_count}pt
-                          </span>
-                          {modeStyle && (
-                            <span style={{
-                              fontSize: 9, padding: "2px 6px", borderRadius: 10,
-                              background: `${modeStyle.color}18`, color: modeStyle.color,
-                              fontFamily: "var(--mono)", fontWeight: 600,
-                            }}>
-                              {modeStyle.icon} {modeStyle.label}
-                            </span>
-                          )}
-                          <button className="btn btn-sm"
-                            style={{ fontSize: 10, padding: "2px 6px", background: "transparent", color: "var(--accent)", border: "1px solid var(--border)" }}
-                            onClick={e => { e.stopPropagation(); setViewAnswer(ans); }}>
-                            👁
-                          </button>
-                        </div>
-                      ) : (
-                        <span className="badge badge-medium" style={{ fontSize: 10, flexShrink: 0 }}>
-                          unanswered
-                        </span>
-                      )}
-                    </div>
-                  );
-                })}
+      {/* Question List */}
+      <div>
+        {Object.entries(groupedByChapter).length === 0 ? (
+          <div className="empty-state">
+            <div className="empty-state-icon">✍️</div>
+            <div className="empty-state-title">No eligible questions</div>
+            <div className="empty-state-text">Run matching and review questions first</div>
+          </div>
+        ) : (
+          Object.entries(groupedByChapter).map(([chName, items]) => (
+            <div key={chName} style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: "var(--accent)", marginBottom: 6, fontFamily: "var(--mono)", letterSpacing: 0.5 }}>
+                📖 {chName} ({items.length})
               </div>
-            ))
-          )}
-        </div>
+              {items.map((m) => {
+                const ans = answers[m.id];
+                const isSelected = selected.includes(m.id);
+                const ansMode = ans?.retrieval_mode;
+                const modeStyle = ansMode ? MODE_INFO[ansMode] : null;
+                return (
+                  <div key={m.id} className="question-row" style={{
+                    display: "flex", gap: 10, alignItems: "center",
+                    padding: "8px 12px", borderRadius: "var(--r)", marginBottom: 4,
+                    background: isSelected ? "rgba(77,127,255,0.08)" : "var(--surface)",
+                    border: `1px solid ${isSelected ? "rgba(77,127,255,0.3)" : "var(--border)"}`,
+                    cursor: "pointer", transition: "all var(--t)",
+                  }}
+                    onClick={() => ans ? setViewAnswer(ans) : toggleSelect(m.id)}
+                  >
+                    {/* Checkbox */}
+                    <div style={{ flexShrink: 0 }}
+                      onClick={e => { e.stopPropagation(); toggleSelect(m.id); }}>
+                      <div style={{
+                        width: 18, height: 18, borderRadius: 4,
+                        border: `2px solid ${isSelected ? "var(--accent)" : "var(--border)"}`,
+                        background: isSelected ? "var(--accent)" : "transparent",
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        fontSize: 11, color: "#fff", transition: "all var(--t)",
+                      }}>
+                        {isSelected && "✓"}
+                      </div>
+                    </div>
 
-        {/* Answer Preview Panel */}
-        {viewAnswer && (
-          <AnswerPreview
-            answer={viewAnswer}
-            onClose={() => setViewAnswer(null)}
-            onDelete={() => handleDeleteAnswer(viewAnswer.id, viewAnswer.mapping_id)}
-            onEdit={async (data) => {
-              try {
-                await updateAnswer(viewAnswer.id, data);
-                showToast("Answer updated", "success");
-                loadData();
-                setViewAnswer(null);
-              } catch (err) { showToast("Update failed", "error"); }
-            }}
-          />
+                    {/* Question text */}
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 13, color: "var(--text)", lineHeight: 1.4 }}>
+                        {m.question_text}
+                      </div>
+                      <div style={{ fontSize: 11, color: "var(--text-dim)", marginTop: 3, fontFamily: "var(--mono)" }}>
+                        {m.question_type} · {((m.confidence || 0) * 100).toFixed(0)}%
+                      </div>
+                    </div>
+
+                    {/* Answer status */}
+                    {ans ? (
+                      <div style={{ display: "flex", gap: 4, alignItems: "center", flexShrink: 0 }}>
+                        <span className="badge badge-high" style={{ fontSize: 10 }}>
+                          {ans.preset} · {ans.bullet_count}pt
+                        </span>
+                        {modeStyle && (
+                          <span style={{
+                            fontSize: 9, padding: "2px 6px", borderRadius: 10,
+                            background: `${modeStyle.color}18`, color: modeStyle.color,
+                            fontFamily: "var(--mono)", fontWeight: 600,
+                          }}>
+                            {modeStyle.icon} {modeStyle.label}
+                          </span>
+                        )}
+                        <button className="btn btn-sm"
+                          style={{ fontSize: 10, padding: "2px 6px", background: "transparent", color: "var(--accent)", border: "1px solid var(--border)" }}
+                          onClick={e => { e.stopPropagation(); setViewAnswer(ans); }}>
+                          👁 View
+                        </button>
+                      </div>
+                    ) : (
+                      <span className="badge badge-medium" style={{ fontSize: 10, flexShrink: 0 }}>
+                        unanswered
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          ))
         )}
       </div>
+
+      {/* Answer Preview Popup Modal */}
+      {viewAnswer && (
+        <AnswerPreview
+          answer={viewAnswer}
+          onClose={() => setViewAnswer(null)}
+          onDelete={() => handleDeleteAnswer(viewAnswer.id, viewAnswer.mapping_id)}
+          onEdit={async (data) => {
+            try {
+              await updateAnswer(viewAnswer.id, data);
+              showToast("Answer updated", "success");
+              loadData();
+              setViewAnswer(null);
+            } catch (err) { showToast("Update failed", "error"); }
+          }}
+        />
+      )}
 
       {toast && <div className={`toast toast-${toast.type}`}>{toast.msg}</div>}
     </div>
@@ -423,15 +521,15 @@ export default function AnswersPage() {
 
 function AnswerPreview({ answer, onClose, onDelete, onEdit }) {
   const [editing, setEditing] = useState(false);
-  const [editPrologue, setEditPrologue] = useState(answer.prologue);
+  const [editPrologue, setEditPrologue] = useState(answer.prologue || "");
   const [editBullets, setEditBullets] = useState(answer.bullets || []);
-  const [editEpilogue, setEditEpilogue] = useState(answer.epilogue);
+  const [editEpilogue, setEditEpilogue] = useState(answer.epilogue || "");
   const [showReport, setShowReport] = useState(false);
 
   useEffect(() => {
-    setEditPrologue(answer.prologue);
+    setEditPrologue(answer.prologue || "");
     setEditBullets(answer.bullets || []);
-    setEditEpilogue(answer.epilogue);
+    setEditEpilogue(answer.epilogue || "");
     setEditing(false);
     setShowReport(false);
   }, [answer.id]);
@@ -455,308 +553,309 @@ function AnswerPreview({ answer, onClose, onDelete, onEdit }) {
   const provenance = meta.bullet_provenance || [];
 
   return (
-    <div style={{
-      width: 440, flexShrink: 0, background: "var(--surface)", border: "1px solid var(--border)",
-      borderRadius: "var(--r)", padding: 16, position: "sticky", top: 16, maxHeight: "calc(100vh - 120px)",
-      overflowY: "auto",
-    }}>
-      {/* Header */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-        <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
-          <span className={`badge badge-${answer.status === "edited" ? "medium" : "high"}`} style={{ fontSize: 10 }}>
-            {answer.preset} · {answer.bullet_count} bullets
-          </span>
-          <span className="badge badge-info" style={{ fontSize: 10 }}>{answer.status}</span>
-          {/* Mode badge */}
-          <span style={{
-            fontSize: 9, padding: "2px 7px", borderRadius: 10,
-            background: `${modeStyle.color}18`, color: modeStyle.color,
-            fontFamily: "var(--mono)", fontWeight: 600,
-          }}>
-            {modeStyle.icon} {modeStyle.label}
-          </span>
-        </div>
-        <button className="btn btn-sm btn-secondary" onClick={onClose} style={{ fontSize: 11 }}>✕</button>
-      </div>
-
-      {/* Confidence Score Bar */}
-      {confidence > 0 && (
-        <div style={{ marginBottom: 12 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-            <span style={{ fontSize: 10, fontWeight: 600, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: 0.8 }}>
-              Answer Confidence
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal-box" style={{ maxWidth: 720, maxHeight: "90vh", overflowY: "auto", padding: 24 }}>
+        {/* Header */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+            <span className={`badge badge-${answer.status === "edited" ? "medium" : "high"}`} style={{ fontSize: 10 }}>
+              {answer.preset} · {answer.bullet_count} bullets
             </span>
+            <span className="badge badge-info" style={{ fontSize: 10 }}>{answer.status}</span>
             <span style={{
-              fontSize: 12, fontWeight: 700,
-              color: confidence >= 70 ? "#34d399" : confidence >= 40 ? "#fbbf24" : "#f87171",
-              fontFamily: "var(--mono)",
+              fontSize: 9, padding: "2px 7px", borderRadius: 10,
+              background: `${modeStyle.color}18`, color: modeStyle.color,
+              fontFamily: "var(--mono)", fontWeight: 600,
             }}>
-              {confidence}%
+              {modeStyle.icon} {modeStyle.label}
             </span>
           </div>
-          <div style={{
-            height: 4, borderRadius: 4, background: "var(--bg)",
-            overflow: "hidden",
-          }}>
-            <div style={{
-              height: "100%", borderRadius: 4, transition: "width 0.5s ease",
-              width: `${confidence}%`,
-              background: confidence >= 70
-                ? "linear-gradient(90deg, #34d399, #10b981)"
-                : confidence >= 40
-                  ? "linear-gradient(90deg, #fbbf24, #f59e0b)"
-                  : "linear-gradient(90deg, #f87171, #ef4444)",
-            }} />
-          </div>
+          <button className="btn btn-secondary btn-sm" onClick={onClose} style={{ fontSize: 11 }}>✕</button>
         </div>
-      )}
 
-      {/* Question */}
-      <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-bright)", marginBottom: 10, lineHeight: 1.4 }}>
-        {answer.question_text}
-      </div>
-
-      {/* Chapter & Source */}
-      <div style={{ fontSize: 11, color: "var(--text-dim)", marginBottom: 14, fontFamily: "var(--mono)" }}>
-        📖 {answer.chapter_name}
-        {pages.length > 0 && <> · {pages.map(([k, v]) => `${k}: ${v}`).join(", ")}</>}
-      </div>
-
-      {editing ? (
-        /* Edit mode */
-        <div>
-          <div className="input-group" style={{ marginBottom: 10 }}>
-            <label className="input-label">Prologue</label>
-            <textarea className="input" rows={2} value={editPrologue}
-              onChange={e => setEditPrologue(e.target.value)}
-              style={{ resize: "vertical", fontFamily: "inherit" }} />
-          </div>
-
-          <div className="input-label" style={{ marginBottom: 6 }}>
-            Bullets ({editBullets.length})
-            <button className="btn btn-sm" style={{ marginLeft: 8, fontSize: 10, padding: "2px 8px" }}
-              onClick={addBullet}>+ Add</button>
-          </div>
-          {editBullets.map((b, i) => (
-            <div key={i} style={{ display: "flex", gap: 4, marginBottom: 4 }}>
-              <span style={{ fontSize: 11, color: "var(--text-dim)", minWidth: 18, paddingTop: 8 }}>{i + 1}.</span>
-              <textarea className="input" rows={1} value={b}
-                onChange={e => updateBullet(i, e.target.value)}
-                style={{ flex: 1, resize: "vertical", fontSize: 12 }} />
-              <button className="btn btn-sm"
-                style={{ fontSize: 10, padding: "4px 6px", color: "var(--danger)", background: "transparent" }}
-                onClick={() => removeBullet(i)}>✕</button>
+        {/* Confidence Score Bar */}
+        {confidence > 0 && (
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+              <span style={{ fontSize: 10, fontWeight: 600, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: 0.8 }}>
+                Answer Confidence
+              </span>
+              <span style={{
+                fontSize: 12, fontWeight: 700,
+                color: confidence >= 70 ? "#34d399" : confidence >= 40 ? "#fbbf24" : "#f87171",
+                fontFamily: "var(--mono)",
+              }}>
+                {confidence}%
+              </span>
             </div>
-          ))}
-
-          <div className="input-group" style={{ marginTop: 10 }}>
-            <label className="input-label">Epilogue</label>
-            <textarea className="input" rows={2} value={editEpilogue}
-              onChange={e => setEditEpilogue(e.target.value)}
-              style={{ resize: "vertical", fontFamily: "inherit" }} />
-          </div>
-
-          <div style={{ display: "flex", gap: 6, marginTop: 12 }}>
-            <button className="btn btn-primary btn-sm" onClick={() => {
-              onEdit({ prologue: editPrologue, bullets: editBullets, epilogue: editEpilogue });
-            }}>💾 Save</button>
-            <button className="btn btn-secondary btn-sm" onClick={() => setEditing(false)}>Cancel</button>
-          </div>
-        </div>
-      ) : (
-        /* View mode */
-        <div>
-          {/* Prologue */}
-          {answer.prologue && (
             <div style={{
-              fontSize: 13, color: "var(--text)", fontStyle: "italic", marginBottom: 12,
-              padding: "8px 12px", background: "rgba(77,127,255,0.05)", borderRadius: 6,
-              borderLeft: "3px solid var(--accent)", lineHeight: 1.5,
+              height: 6, borderRadius: 4, background: "var(--bg)",
+              overflow: "hidden",
             }}>
-              {answer.prologue}
+              <div style={{
+                height: "100%", borderRadius: 4, transition: "width 0.5s ease",
+                width: `${confidence}%`,
+                background: confidence >= 70
+                  ? "linear-gradient(90deg, #34d399, #10b981)"
+                  : confidence >= 40
+                    ? "linear-gradient(90deg, #fbbf24, #f59e0b)"
+                    : "linear-gradient(90deg, #f87171, #ef4444)",
+              }} />
             </div>
-          )}
+          </div>
+        )}
 
-          {/* Bullets with provenance badges */}
-          <div style={{ marginBottom: 12 }}>
-            {(answer.bullets || []).map((b, i) => {
-              const prov = provenance[i];
-              const provStyle = prov ? PROVENANCE_STYLE[prov] : null;
-              return (
-                <div key={i} style={{
-                  display: "flex", gap: 8, padding: "5px 0",
-                  borderBottom: "1px solid rgba(255,255,255,0.03)",
-                }}>
-                  <span style={{
-                    fontSize: 11, fontWeight: 700, color: "var(--accent)",
-                    minWidth: 20, fontFamily: "var(--mono)",
+        {/* Question */}
+        <div style={{ fontSize: 16, fontWeight: 600, color: "var(--text-bright)", marginBottom: 10, lineHeight: 1.4 }}>
+          {answer.question_text}
+        </div>
+
+        {/* Chapter & Source */}
+        <div style={{ fontSize: 12, color: "var(--text-dim)", marginBottom: 16, fontFamily: "var(--mono)" }}>
+          📖 {answer.chapter_name}
+          {pages.length > 0 && <> · {pages.map(([k, v]) => `${k}: ${v}`).join(", ")}</>}
+        </div>
+
+        {editing ? (
+          /* Edit mode */
+          <div>
+            <div className="input-group" style={{ marginBottom: 12 }}>
+              <label className="input-label">Prologue</label>
+              <textarea className="input" rows={3} value={editPrologue}
+                onChange={e => setEditPrologue(e.target.value)}
+                style={{ resize: "vertical", fontFamily: "inherit" }} />
+            </div>
+
+            <div className="input-label" style={{ marginBottom: 6, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span>Bullets ({editBullets.length})</span>
+              <button className="btn btn-sm btn-secondary" style={{ fontSize: 10, padding: "2px 8px" }}
+                onClick={addBullet}>+ Add Bullet</button>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
+              {editBullets.map((b, i) => (
+                <div key={i} style={{ display: "flex", gap: 6 }}>
+                  <span style={{ fontSize: 11, color: "var(--text-dim)", minWidth: 18, paddingTop: 8 }}>{i + 1}.</span>
+                  <textarea className="input" rows={2} value={b}
+                    onChange={e => updateBullet(i, e.target.value)}
+                    style={{ flex: 1, resize: "vertical", fontSize: 12 }} />
+                  <button className="btn btn-sm"
+                    style={{ fontSize: 10, padding: "4px 8px", color: "var(--danger)", background: "transparent" }}
+                    onClick={() => removeBullet(i)}>✕</button>
+                </div>
+              ))}
+            </div>
+
+            <div className="input-group" style={{ marginTop: 12 }}>
+              <label className="input-label">Epilogue</label>
+              <textarea className="input" rows={3} value={editEpilogue}
+                onChange={e => setEditEpilogue(e.target.value)}
+                style={{ resize: "vertical", fontFamily: "inherit" }} />
+            </div>
+
+            <div style={{ display: "flex", gap: 8, marginTop: 16, justifyContent: "flex-end" }}>
+              <button className="btn btn-secondary" onClick={() => setEditing(false)}>Cancel</button>
+              <button className="btn btn-primary" onClick={() => {
+                onEdit({ prologue: editPrologue, bullets: editBullets, epilogue: editEpilogue });
+              }}>Save Answer</button>
+            </div>
+          </div>
+        ) : (
+          /* View mode */
+          <div>
+            {/* Prologue */}
+            {answer.prologue && (
+              <div style={{
+                fontSize: 13.5, color: "var(--text)", fontStyle: "italic", marginBottom: 16,
+                padding: "10px 14px", background: "rgba(77,127,255,0.05)", borderRadius: 6,
+                borderLeft: "3px solid var(--accent)", lineHeight: 1.5,
+              }}>
+                {renderMarkdown(answer.prologue)}
+              </div>
+            )}
+
+            {/* Bullets with provenance badges */}
+            <div style={{ marginBottom: 16, display: "flex", flexDirection: "column", gap: 10 }}>
+              {(answer.bullets || []).map((b, i) => {
+                const prov = provenance[i];
+                const provStyle = prov ? PROVENANCE_STYLE[prov] : null;
+                return (
+                  <div key={i} style={{
+                    display: "flex", gap: 8, paddingBottom: 10,
+                    borderBottom: "1px solid rgba(255,255,255,0.03)",
                   }}>
-                    {String(i + 1).padStart(2, "0")}
-                  </span>
-                  <span style={{ fontSize: 12.5, color: "var(--text)", lineHeight: 1.5, flex: 1 }}>{b}</span>
-                  {provStyle && (
                     <span style={{
-                      fontSize: 8, padding: "2px 5px", borderRadius: 4, flexShrink: 0,
-                      background: provStyle.bg, color: provStyle.color,
-                      fontFamily: "var(--mono)", fontWeight: 700, alignSelf: "flex-start",
-                      marginTop: 2,
+                      fontSize: 12, fontWeight: 700, color: "var(--accent)",
+                      minWidth: 24, fontFamily: "var(--mono)", paddingTop: 2
                     }}>
-                      {provStyle.label}
+                      {String(i + 1).padStart(2, "0")}
                     </span>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-
-          {/* Epilogue */}
-          {answer.epilogue && (
-            <div style={{
-              fontSize: 13, color: "var(--text)", fontStyle: "italic", marginBottom: 12,
-              padding: "8px 12px", background: "rgba(52,211,153,0.05)", borderRadius: 6,
-              borderLeft: "3px solid var(--success)", lineHeight: 1.5,
-            }}>
-              {answer.epilogue}
-            </div>
-          )}
-
-          {/* Images */}
-          {answer.images && answer.images.length > 0 && (
-            <div style={{ marginBottom: 12 }}>
-              <div style={{ fontSize: 10, fontWeight: 700, color: "var(--text-dim)", marginBottom: 6, textTransform: "uppercase", letterSpacing: 1 }}>
-                📸 Reference Images ({answer.images.length})
-              </div>
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                {answer.images.map((img, ii) => {
-                  const tbId = img.filename?.split("_p")[0] || "unknown";
-                  return (
-                    <div key={ii} style={{
-                      border: "1px solid var(--border)", borderRadius: 6,
-                      overflow: "hidden", maxWidth: 180, background: "var(--bg)",
-                    }}>
-                      <img
-                        src={`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/api/images/${tbId}/${img.filename}`}
-                        alt={img.caption || `Page ${img.page}`}
-                        style={{ maxWidth: "100%", maxHeight: 160, objectFit: "contain", display: "block", cursor: "pointer" }}
-                        onClick={() => window.open(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/api/images/${tbId}/${img.filename}`, "_blank")}
-                        onError={e => { e.target.style.display = "none"; }}
-                      />
-                      <div style={{ padding: "3px 6px", fontSize: 9, color: "var(--text-dim)" }}>
-                        p.{img.page}{img.caption ? ` — ${img.caption.substring(0, 80)}` : ""}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          {/* ── Retrieval Report (Explainability) ── */}
-          {meta && (meta.concepts_matched?.length > 0 || meta.relation_context?.length > 0) && (
-            <div style={{ marginBottom: 12 }}>
-              <button
-                className="btn btn-sm btn-secondary"
-                style={{ fontSize: 10, marginBottom: 8, display: "flex", alignItems: "center", gap: 4 }}
-                onClick={() => setShowReport(!showReport)}
-              >
-                📊 {showReport ? "Hide" : "Show"} Retrieval Report
-              </button>
-              {showReport && (
-                <div style={{
-                  padding: 12, borderRadius: 8,
-                  background: "rgba(129,140,248,0.05)",
-                  border: "1px solid rgba(129,140,248,0.15)",
-                }}>
-                  {/* Mode & Stats */}
-                  <div style={{ fontSize: 11, color: "var(--text)", marginBottom: 8, lineHeight: 1.5 }}>
-                    <strong style={{ color: modeStyle.color }}>{modeStyle.icon} {modeStyle.label}</strong> retrieval
-                    <br />
-                    <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: "var(--text-dim)" }}>
-                      Vector chunks: {meta.vector_chunks_used || 0} · Graph chunks: {meta.graph_chunks_used || 0}
-                      {meta.overlap_count > 0 && ` · Overlap: ${meta.overlap_count}`}
+                    <span style={{ fontSize: 13, color: "var(--text)", lineHeight: 1.5, flex: 1 }}>
+                      {renderMarkdown(b)}
                     </span>
-                  </div>
-
-                  {/* Concepts Matched */}
-                  {meta.concepts_matched?.length > 0 && (
-                    <div style={{ marginBottom: 8 }}>
-                      <div style={{ fontSize: 9, fontWeight: 700, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: 1, marginBottom: 4 }}>
-                        Concepts Matched ({meta.concepts_matched.length})
-                      </div>
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: 3 }}>
-                        {meta.concepts_matched.map((c, i) => (
-                          <span key={i} style={{
-                            fontSize: 10, padding: "2px 7px", borderRadius: 10,
-                            background: "rgba(129,140,248,0.12)", color: "#818cf8",
-                            fontWeight: 500,
-                          }}>
-                            {c}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Relation Chains */}
-                  {meta.relation_context?.length > 0 && (
-                    <div style={{ marginBottom: 8 }}>
-                      <div style={{ fontSize: 9, fontWeight: 700, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: 1, marginBottom: 4 }}>
-                        Relation Chains ({meta.relation_context.length})
-                      </div>
-                      <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                        {meta.relation_context.slice(0, 8).map((rc, i) => (
-                          <div key={i} style={{
-                            fontSize: 10, color: "var(--text)", fontFamily: "var(--mono)",
-                            padding: "2px 6px", borderRadius: 4,
-                            background: "rgba(52,211,153,0.06)",
-                          }}>
-                            {rc}
-                          </div>
-                        ))}
-                        {meta.relation_context.length > 8 && (
-                          <div style={{ fontSize: 9, color: "var(--text-dim)", fontStyle: "italic" }}>
-                            +{meta.relation_context.length - 8} more...
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Fusion Notes */}
-                  {meta.fusion_notes && (
-                    <div>
-                      <div style={{ fontSize: 9, fontWeight: 700, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: 1, marginBottom: 4 }}>
-                        Fusion Notes
-                      </div>
-                      <div style={{
-                        fontSize: 11, color: "var(--text)", lineHeight: 1.4,
-                        padding: "6px 8px", borderRadius: 4,
-                        background: "rgba(52,211,153,0.08)",
-                        borderLeft: "2px solid #34d399",
+                    {provStyle && (
+                      <span style={{
+                        fontSize: 8, padding: "2px 5px", borderRadius: 4, flexShrink: 0,
+                        background: provStyle.bg, color: provStyle.color,
+                        fontFamily: "var(--mono)", fontWeight: 700, alignSelf: "flex-start",
+                        marginTop: 2,
                       }}>
-                        {meta.fusion_notes}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
+                        {provStyle.label}
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
             </div>
-          )}
 
-          {/* Actions */}
-          <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
-            <button className="btn btn-secondary btn-sm" onClick={() => setEditing(true)}>✏️ Edit</button>
-            <button className="btn btn-sm"
-              style={{ background: "var(--danger-bg)", color: "var(--danger)", border: "1px solid rgba(248,113,113,0.3)" }}
-              onClick={onDelete}>🗑 Delete</button>
-          </div>
+            {/* Epilogue */}
+            {answer.epilogue && (
+              <div style={{
+                fontSize: 13.5, color: "var(--text)", fontStyle: "italic", marginBottom: 16,
+                padding: "10px 14px", background: "rgba(52,211,153,0.05)", borderRadius: 6,
+                borderLeft: "3px solid var(--success)", lineHeight: 1.5,
+              }}>
+                {renderMarkdown(answer.epilogue)}
+              </div>
+            )}
 
-          <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 10, fontFamily: "var(--mono)" }}>
-            Generated {answer.generated_at ? new Date(answer.generated_at).toLocaleString() : "—"}
-            {answer.model_used && ` · ${answer.model_used}`}
+            {/* Images */}
+            {answer.images && answer.images.length > 0 && (
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ fontSize: 10, fontWeight: 700, color: "var(--text-dim)", marginBottom: 8, textTransform: "uppercase", letterSpacing: 1 }}>
+                  📸 Reference Images ({answer.images.length})
+                </div>
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  {answer.images.map((img, ii) => {
+                    const tbId = img.filename?.split("_p")[0] || "unknown";
+                    return (
+                      <div key={ii} style={{
+                        border: "1px solid var(--border)", borderRadius: 6,
+                        overflow: "hidden", maxWidth: 200, background: "var(--bg)",
+                      }}>
+                        <img
+                          src={`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/api/images/${tbId}/${img.filename}`}
+                          alt={img.caption || `Page ${img.page}`}
+                          style={{ maxWidth: "100%", maxHeight: 180, objectFit: "contain", display: "block", cursor: "pointer" }}
+                          onClick={() => window.open(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/api/images/${tbId}/${img.filename}`, "_blank")}
+                          onError={e => { e.target.style.display = "none"; }}
+                        />
+                        <div style={{ padding: "4px 8px", fontSize: 9, color: "var(--text-dim)" }}>
+                          p.{img.page}{img.caption ? ` — ${img.caption.substring(0, 80)}` : ""}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* ── Retrieval Report (Explainability) ── */}
+            {meta && (meta.concepts_matched?.length > 0 || meta.relation_context?.length > 0) && (
+              <div style={{ marginBottom: 16 }}>
+                <button
+                  className="btn btn-sm btn-secondary"
+                  style={{ fontSize: 10, marginBottom: 8, display: "flex", alignItems: "center", gap: 4 }}
+                  onClick={() => setShowReport(!showReport)}
+                >
+                  📊 {showReport ? "Hide" : "Show"} Retrieval Report
+                </button>
+                {showReport && (
+                  <div style={{
+                    padding: 14, borderRadius: 8,
+                    background: "rgba(129,140,248,0.05)",
+                    border: "1px solid rgba(129,140,248,0.15)",
+                  }}>
+                    {/* Mode & Stats */}
+                    <div style={{ fontSize: 11.5, color: "var(--text)", marginBottom: 8, lineHeight: 1.5 }}>
+                      <strong style={{ color: modeStyle.color }}>{modeStyle.icon} {modeStyle.label}</strong> retrieval
+                      <br />
+                      <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: "var(--text-dim)" }}>
+                        Vector chunks: {meta.vector_chunks_used || 0} · Graph chunks: {meta.graph_chunks_used || 0}
+                        {meta.overlap_count > 0 && ` · Overlap: ${meta.overlap_count}`}
+                      </span>
+                    </div>
+
+                    {/* Concepts Matched */}
+                    {meta.concepts_matched?.length > 0 && (
+                      <div style={{ marginBottom: 8 }}>
+                        <div style={{ fontSize: 9, fontWeight: 700, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: 1, marginBottom: 4 }}>
+                          Concepts Matched ({meta.concepts_matched.length})
+                        </div>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                          {meta.concepts_matched.map((c, i) => (
+                            <span key={i} style={{
+                              fontSize: 10.5, padding: "2px 7px", borderRadius: 10,
+                              background: "rgba(129,140,248,0.12)", color: "#818cf8",
+                              fontWeight: 500,
+                            }}>
+                              {c}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Relation Chains */}
+                    {meta.relation_context?.length > 0 && (
+                      <div style={{ marginBottom: 8 }}>
+                        <div style={{ fontSize: 9, fontWeight: 700, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: 1, marginBottom: 4 }}>
+                          Relation Chains ({meta.relation_context.length})
+                        </div>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                          {meta.relation_context.slice(0, 8).map((rc, i) => (
+                            <div key={i} style={{
+                              fontSize: 10.5, color: "var(--text)", fontFamily: "var(--mono)",
+                              padding: "4px 8px", borderRadius: 4,
+                              background: "rgba(52,211,153,0.06)",
+                            }}>
+                              {rc}
+                            </div>
+                          ))}
+                          {meta.relation_context.length > 8 && (
+                            <div style={{ fontSize: 9, color: "var(--text-dim)", fontStyle: "italic" }}>
+                              +{meta.relation_context.length - 8} more...
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Fusion Notes */}
+                    {meta.fusion_notes && (
+                      <div>
+                        <div style={{ fontSize: 9, fontWeight: 700, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: 1, marginBottom: 4 }}>
+                          Fusion Notes
+                        </div>
+                        <div style={{
+                          fontSize: 11, color: "var(--text)", lineHeight: 1.4,
+                          padding: "8px 10px", borderRadius: 4,
+                          background: "rgba(52,211,153,0.08)",
+                          borderLeft: "2px solid #34d399",
+                        }}>
+                          {renderMarkdown(meta.fusion_notes)}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Actions */}
+            <div style={{ display: "flex", gap: 8, marginTop: 16, justifyContent: "flex-end" }}>
+              <button className="btn btn-secondary btn-sm" onClick={() => setEditing(true)}>✏️ Edit</button>
+              <button className="btn btn-sm"
+                style={{ background: "var(--danger-bg)", color: "var(--danger)", border: "1px solid rgba(248,113,113,0.3)" }}
+                onClick={onDelete}>🗑 Delete</button>
+            </div>
+
+            <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 16, fontFamily: "var(--mono)" }}>
+              Generated {answer.generated_at ? new Date(answer.generated_at).toLocaleString() : "—"}
+              {answer.model_used && ` · ${answer.model_used}`}
+            </div>
           </div>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }

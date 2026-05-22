@@ -59,6 +59,7 @@ export async function uploadQP(file, subject, metadata = {}) {
   if (metadata.university) formData.append("university", metadata.university);
   if (metadata.year) formData.append("year", metadata.year);
   if (metadata.month) formData.append("month", metadata.month);
+  if (metadata.schema) formData.append("schema", metadata.schema);
 
   const res = await fetch(`${API_BASE}/papers/upload`, {
     method: "POST",
@@ -220,6 +221,10 @@ export async function updateSettings(data) {
   });
 }
 
+export async function getSystemInfo() {
+  return fetchAPI("/settings/sysinfo");
+}
+
 // ── Textbook Chapters Detail ──
 export async function getTextbookChapters(textbookId) {
   return fetchAPI(`/textbooks/${textbookId}/chapters`);
@@ -292,13 +297,14 @@ export async function getAnswerStats() {
 }
 
 // ── QB Firestore Push ──
-export async function qbPushToFirestore(subject, mappingIds = null, uploadImages = true) {
+export async function qbPushToFirestore(subject, mappingIds = null, uploadImages = true, dryRun = false) {
   return fetchAPI("/qb/push-to-firestore", {
     method: "POST",
     body: JSON.stringify({
       subject,
       mapping_ids: mappingIds,
       upload_images: uploadImages,
+      dry_run: dryRun,
     }),
   });
 }

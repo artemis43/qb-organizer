@@ -172,6 +172,7 @@ async def extract_questions_from_qp(
             "university": meta.get("university"),
             "year": meta.get("year"),
             "month": meta.get("month"),
+            "schema": meta.get("schema"),
             "total_pages": pdf_info.total_pages,
             "sha256_hash": pdf_info.sha256_hash,
             "status": "in_progress",
@@ -261,6 +262,7 @@ async def extract_questions_from_qp(
             "university": meta.get("university"),
             "year": meta.get("year"),
             "month": meta.get("month"),
+            "schema": meta.get("schema"),
             "total_questions": len(saved_questions),
             "status": "completed",
         })

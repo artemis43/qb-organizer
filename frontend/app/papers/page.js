@@ -121,6 +121,7 @@ export default function PapersPage() {
       {showUpload && (
         <UploadForm
           subjects={subjects}
+          papers={papers}
           onClose={() => setShowUpload(false)}
           onSuccess={() => { setShowUpload(false); loadAll(); }}
           showToast={showToast}
@@ -360,19 +361,27 @@ export default function PapersPage() {
   );
 }
 
-function UploadForm({ subjects, onClose, onSuccess, showToast }) {
+function UploadForm({ subjects, papers, onClose, onSuccess, showToast }) {
   const [file, setFile] = useState(null);
   const [subject, setSubject] = useState("");
   const [customSubject, setCustomSubject] = useState("");
-  const [university, setUniversity] = useState("");
+  const [selectedUni, setSelectedUni] = useState("");
+  const [customUni, setCustomUni] = useState("");
   const [year, setYear] = useState("");
   const [month, setMonth] = useState("");
+  const [selectedSchemas, setSelectedSchemas] = useState([]);
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState(null);
   const fileRef = useRef(null);
   const [dragOver, setDragOver] = useState(false);
 
   const effectiveSubject = subject === "__custom__" ? customSubject : subject;
+  const effectiveUni = selectedUni === "__custom__" ? customUni : selectedUni;
+
+  const existingUnis = Array.from(new Set(papers.map(p => p.university).filter(Boolean)));
+  const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+  const years = Array.from({ length: 11 }, (_, i) => 2020 + i);
+  const SCHEMAS = ["RS-1", "RS-2", "RS-3", "RS-4", "RS-5", "RS-6", "RS-7", "RS-8"];
 
   function handleDrop(e) {
     e.preventDefault(); setDragOver(false);
@@ -380,12 +389,24 @@ function UploadForm({ subjects, onClose, onSuccess, showToast }) {
     if (dropped?.type === "application/pdf") setFile(dropped);
   }
 
+  function toggleSchema(sch) {
+    setSelectedSchemas(prev =>
+      prev.includes(sch) ? prev.filter(x => x !== sch) : [...prev, sch]
+    );
+  }
+
   async function handleSubmit(e) {
     e.preventDefault();
     if (!file || !effectiveSubject) return;
     setUploading(true);
     try {
-      const result = await uploadQP(file, effectiveSubject, { university, year, month });
+      const metadata = {
+        university: effectiveUni,
+        year: year ? parseInt(year) : undefined,
+        month,
+        schema: selectedSchemas.join(", "),
+      };
+      const result = await uploadQP(file, effectiveSubject, metadata);
       if (result.task_id) {
         connectProgress(result.task_id, (data) => {
           setProgress(data);
@@ -397,70 +418,122 @@ function UploadForm({ subjects, onClose, onSuccess, showToast }) {
   }
 
   return (
-    <div className="card" style={{ marginBottom: 20 }}>
-      <div className="card-header">
-        <span className="card-title">Upload Question Paper</span>
-        <button className="btn btn-secondary btn-sm" onClick={onClose}>✕</button>
-      </div>
-      <form onSubmit={handleSubmit}>
-        <div className={`file-upload-zone ${dragOver ? "drag-over" : ""}`}
-          onDragOver={e => { e.preventDefault(); setDragOver(true); }}
-          onDragLeave={() => setDragOver(false)} onDrop={handleDrop}
-          onClick={() => fileRef.current.click()} style={{ marginBottom: 14 }}>
-          <input ref={fileRef} type="file" accept=".pdf" style={{ display: "none" }}
-            onChange={e => { if (e.target.files[0]) setFile(e.target.files[0]); }} />
-          {file ? (
-            <><div className="file-upload-icon">✅</div><div className="file-upload-text">{file.name}</div><div className="file-upload-hint">{(file.size/1024/1024).toFixed(1)} MB</div></>
-          ) : (
-            <><div className="file-upload-icon">📝</div><div className="file-upload-text">Drop a question paper PDF here</div><div className="file-upload-hint">PDF format — will auto-extract questions</div></>
-          )}
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && !uploading && onClose()}>
+      <div className="modal-box" style={{ maxWidth: 560 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <h3 style={{ margin: 0 }}>📝 Upload Question Paper</h3>
+          <button className="btn btn-secondary btn-sm" onClick={onClose} disabled={uploading}>✕</button>
         </div>
-
-        <div className="grid-2" style={{ marginBottom: 4 }}>
-          <div className="input-group">
-            <label className="input-label">Subject</label>
-            {subjects.length > 0 ? (
-              <select className="select" value={subject} onChange={e => setSubject(e.target.value)} required>
-                <option value="">Select subject...</option>
-                {subjects.map(s => (
-                  <option key={s.subject} value={s.subject}>{s.subject} ({s.textbook_count} textbook{s.textbook_count !== 1 ? "s" : ""})</option>
-                ))}
-                <option value="__custom__">+ Add new subject...</option>
-              </select>
+        <form onSubmit={handleSubmit}>
+          <div className={`file-upload-zone ${dragOver ? "drag-over" : ""}`}
+            onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+            onDragLeave={() => setDragOver(false)} onDrop={handleDrop}
+            onClick={() => !uploading && fileRef.current.click()} style={{ marginBottom: 14 }}>
+            <input ref={fileRef} type="file" accept=".pdf" style={{ display: "none" }} disabled={uploading}
+              onChange={e => { if (e.target.files[0]) setFile(e.target.files[0]); }} />
+            {file ? (
+              <><div className="file-upload-icon">✅</div><div className="file-upload-text">{file.name}</div><div className="file-upload-hint">{(file.size/1024/1024).toFixed(1)} MB</div></>
             ) : (
-              <input className="input" value={customSubject} onChange={e => setCustomSubject(e.target.value)} placeholder="e.g. Orthopaedics" required />
-            )}
-            {subject === "__custom__" && (
-              <input className="input" value={customSubject} onChange={e => setCustomSubject(e.target.value)} placeholder="Enter new subject name" style={{ marginTop: 6 }} required />
+              <><div className="file-upload-icon">📝</div><div className="file-upload-text">Drop a question paper PDF here</div><div className="file-upload-hint">PDF format — will auto-extract questions</div></>
             )}
           </div>
-          <div className="input-group">
-            <label className="input-label">University</label>
-            <input className="input" value={university} onChange={e => setUniversity(e.target.value)} placeholder="e.g. RGUHS" />
-          </div>
-        </div>
-        <div className="grid-2">
-          <div className="input-group">
-            <label className="input-label">Year</label>
-            <input className="input" type="number" value={year} onChange={e => setYear(e.target.value)} placeholder="e.g. 2024" />
-          </div>
-          <div className="input-group">
-            <label className="input-label">Month</label>
-            <input className="input" value={month} onChange={e => setMonth(e.target.value)} placeholder="e.g. June" />
-          </div>
-        </div>
 
-        {progress && (
-          <div style={{ marginBottom: 14 }}>
-            <div className="progress-bar-container"><div className="progress-bar-fill" style={{ width: `${progress.percentage || 0}%` }} /></div>
-            <div className="progress-text"><span>{progress.message}</span><span>{(progress.percentage||0).toFixed(0)}%</span></div>
+          <div className="grid-2" style={{ marginBottom: 4 }}>
+            <div className="input-group">
+              <label className="input-label">Subject</label>
+              {subjects.length > 0 ? (
+                <select className="select" value={subject} onChange={e => setSubject(e.target.value)} required disabled={uploading}>
+                  <option value="">Select subject...</option>
+                  {subjects.map(s => (
+                    <option key={s.subject} value={s.subject}>{s.subject} ({s.textbook_count} textbook{s.textbook_count !== 1 ? "s" : ""})</option>
+                  ))}
+                  <option value="__custom__">+ Add new subject...</option>
+                </select>
+              ) : (
+                <input className="input" value={customSubject} onChange={e => setCustomSubject(e.target.value)} placeholder="e.g. Orthopaedics" required disabled={uploading} />
+              )}
+              {subject === "__custom__" && (
+                <input className="input" value={customSubject} onChange={e => setCustomSubject(e.target.value)} placeholder="Enter new subject name" style={{ marginTop: 6 }} required disabled={uploading} />
+              )}
+            </div>
+            <div className="input-group">
+              <label className="input-label">University</label>
+              <select className="select" value={selectedUni} onChange={e => setSelectedUni(e.target.value)} disabled={uploading}>
+                <option value="">Select university...</option>
+                {existingUnis.map(u => (
+                  <option key={u} value={u}>{u}</option>
+                ))}
+                <option value="__custom__">+ Add new university...</option>
+              </select>
+              {(selectedUni === "__custom__" || existingUnis.length === 0) && (
+                <input className="input" value={customUni} onChange={e => setCustomUni(e.target.value)} placeholder="Enter university (e.g. RGUHS)" style={{ marginTop: 6 }} required disabled={uploading} />
+              )}
+            </div>
           </div>
-        )}
+          <div className="grid-2">
+            <div className="input-group">
+              <label className="input-label">Year</label>
+              <select className="select" value={year} onChange={e => setYear(e.target.value)} disabled={uploading}>
+                <option value="">Select year...</option>
+                {years.map(y => (
+                  <option key={y} value={y}>{y}</option>
+                ))}
+              </select>
+            </div>
+            <div className="input-group">
+              <label className="input-label">Month</label>
+              <select className="select" value={month} onChange={e => setMonth(e.target.value)} disabled={uploading}>
+                <option value="">Select month...</option>
+                {months.map(m => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+            </div>
+          </div>
 
-        <button className="btn btn-primary" type="submit" disabled={uploading || !file || !effectiveSubject}>
-          {uploading ? "Uploading & Extracting..." : "Upload & Extract Questions"}
-        </button>
-      </form>
+          <div className="input-group" style={{ marginTop: 8, marginBottom: 14 }}>
+            <label className="input-label">Schema</label>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {SCHEMAS.map(sch => {
+                const isSelected = selectedSchemas.includes(sch);
+                return (
+                  <button
+                    key={sch}
+                    type="button"
+                    className={`btn btn-sm ${isSelected ? 'btn-primary' : 'btn-secondary'}`}
+                    onClick={() => toggleSchema(sch)}
+                    disabled={uploading}
+                    style={{
+                      borderRadius: 16,
+                      padding: "4px 12px",
+                      fontSize: 12,
+                      border: isSelected ? "none" : "1px solid var(--border)",
+                      background: isSelected ? "var(--accent)" : "transparent",
+                      color: isSelected ? "#fff" : "var(--text-dim)",
+                    }}
+                  >
+                    {sch}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {progress && (
+            <div style={{ marginBottom: 14 }}>
+              <div className="progress-bar-container"><div className="progress-bar-fill" style={{ width: `${progress.percentage || 0}%` }} /></div>
+              <div className="progress-text"><span>{progress.message}</span><span>{(progress.percentage||0).toFixed(0)}%</span></div>
+            </div>
+          )}
+
+          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 16 }}>
+            <button className="btn btn-secondary" type="button" onClick={onClose} disabled={uploading}>Cancel</button>
+            <button className="btn btn-primary" type="submit" disabled={uploading || !file || !effectiveSubject}>
+              {uploading ? "Uploading & Extracting..." : "Upload & Extract Questions"}
+            </button>
+          </div>
+        </form>
+      </div>
     </div>
   );
 }

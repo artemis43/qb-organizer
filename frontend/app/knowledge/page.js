@@ -56,6 +56,13 @@ const RELATION_LABELS = {
   synonym_of:       "synonym of",
   precedes:         "precedes",
   managed_by:       "managed by",
+  produces:         "produces",
+  metabolized_by:   "metabolized by",
+  innervated_by:    "innervated by",
+  vascularized_by:  "vascularized by",
+  contraindicated_in: "contraindicated in",
+  indicated_in:     "indicated in",
+  side_effect_of:   "side effect of",
 };
 const IMPORTANCE_COLORS = {
   must_know: { color: "#f87171", label: "🔴 Must-Know" },
@@ -209,18 +216,19 @@ function GraphCanvas({ nodes, edges, onSelectNode, selectedNodeId, height = 520 
         // Edge label
         if (isHi && RELATION_LABELS[e.relation_type]) {
           ctx.font = "bold 10px 'Inter', 'Segoe UI', sans-serif";
+          const labelText = `${RELATION_LABELS[e.relation_type]} (${Math.round((e.confidence || 0.9) * 100)}%)`;
           ctx.fillStyle = "rgba(140,160,255,0.95)";
           ctx.textAlign = "center";
           const lx = (sx + tx) / 2, ly = (sy + ty) / 2 - 8;
           // Label background
-          const tw = ctx.measureText(RELATION_LABELS[e.relation_type]).width;
+          const tw = ctx.measureText(labelText).width;
           ctx.fillStyle = "rgba(8,8,20,0.9)";
           ctx.fillRect(lx - tw / 2 - 6, ly - 8, tw + 12, 16);
           ctx.strokeStyle = "rgba(99,140,255,0.3)";
           ctx.lineWidth = 1;
           ctx.strokeRect(lx - tw / 2 - 6, ly - 8, tw + 12, 16);
           ctx.fillStyle = "rgba(140,170,255,0.95)";
-          ctx.fillText(RELATION_LABELS[e.relation_type], lx, ly + 4);
+          ctx.fillText(labelText, lx, ly + 4);
         }
       });
       // Draw nodes
@@ -684,6 +692,7 @@ export default function KnowledgeGraphPage() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [textbooks, setTextbooks] = useState([]);
   const [stats, setStats] = useState(null);
+  const [graphLimit, setGraphLimit] = useState(150);
   // State
 
   const [selSubject, setSelSubject] = useState("");
@@ -750,9 +759,14 @@ export default function KnowledgeGraphPage() {
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState(null);
   useEffect(() => { loadData(); }, []);
+  
+  useEffect(() => {
+    setGraphLimit(150);
+  }, [selSubject, selTypeFilter]);
+
   useEffect(() => {
     if (selSubject && tab === "graph") loadGraph();
-  }, [selSubject, selTypeFilter, tab]);
+  }, [selSubject, selTypeFilter, tab, graphLimit]);
 
   // Escape key handler for fullscreen mode
   useEffect(() => {
@@ -799,7 +813,7 @@ export default function KnowledgeGraphPage() {
   async function loadGraph() {
 
     try {
-      const data = await kgGetGraph(selSubject || null, selTypeFilter || null, 150);
+      const data = await kgGetGraph(selSubject || null, selTypeFilter || null, graphLimit);
       setGraphData(data);
       setSelectedNodeId(null);
       setSelectedConcept(null);
@@ -1223,12 +1237,26 @@ export default function KnowledgeGraphPage() {
       {tab === "graph" && (
         <div>
           {/* Graph Toolbar */}
-          <div style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center" }}>
-            <div style={{ fontSize: 12, color: "var(--text-dim)" }}>
-              {filteredGraphData.total_nodes || 0} nodes · {filteredGraphData.total_edges || 0} edges
-              {selSubject && <> · {selSubject}</>}
-              {importanceFilter && <span style={{ color: IMPORTANCE_COLORS[importanceFilter]?.color }}> · {IMPORTANCE_COLORS[importanceFilter]?.label}</span>}
+          <div style={{ display: "flex", gap: 12, marginBottom: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <div style={{ fontSize: 12, color: "var(--text-dim)", display: "flex", alignItems: "center", gap: 8 }}>
+              <span>
+                Showing <strong>{filteredGraphData.total_nodes || 0}</strong> of{" "}
+                <strong>{graphData.total_db_nodes || filteredGraphData.total_nodes || 0}</strong> concepts
+              </span>
+              <span style={{ opacity: 0.35 }}>|</span>
+              <span>{filteredGraphData.total_edges || 0} relations</span>
+              {selSubject && <span style={{ color: "var(--accent)", fontWeight: 500 }}>· {selSubject}</span>}
             </div>
+
+            {graphData.total_db_nodes > (graphData.nodes || []).length && (graphData.nodes || []).length < 1000 && (
+              <button
+                className="btn btn-xs btn-primary"
+                style={{ height: "auto", padding: "4px 8px", fontSize: 10, borderRadius: 6, display: "flex", alignItems: "center", gap: 4 }}
+                onClick={() => setGraphLimit(prev => Math.min(prev + 150, 1000))}
+              >
+                <span>➕</span> Load More
+              </button>
+            )}
             <div style={{ flex: 1 }} />
 
             {/* View Mode Toggle */}
@@ -1706,8 +1734,27 @@ export default function KnowledgeGraphPage() {
                 fontWeight: 600,
                 border: "1px solid rgba(129,140,248,0.25)"
               }}>
-                {graphData.nodes.length} concepts · {graphData.edges.length} relations
+                {filteredGraphData.total_nodes} / {graphData.total_db_nodes || filteredGraphData.total_nodes} concepts · {filteredGraphData.total_edges} relations
               </span>
+              {graphData.total_db_nodes > (graphData.nodes || []).length && (graphData.nodes || []).length < 1000 && (
+                <button
+                  style={{
+                    background: "rgba(129, 140, 248, 0.25)",
+                    border: "1px solid rgba(129, 140, 248, 0.4)",
+                    color: "#fff",
+                    padding: "4px 10px",
+                    borderRadius: 6,
+                    fontSize: 10,
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 4,
+                  }}
+                  onClick={() => setGraphLimit(prev => Math.min(prev + 150, 1000))}
+                >
+                  <span>➕</span> Load More
+                </button>
+              )}
             </div>
 
             {/* Middle: Filters & View Toggles */}
@@ -1996,8 +2043,8 @@ export default function KnowledgeGraphPage() {
               maxWidth: 300,
             }}>
               <div style={{ fontWeight: 700, color: "#fff", fontSize: 11 }}>
-                📊 {filteredGraphData.total_nodes} / {(graphData.nodes || []).length} nodes
-                · {filteredGraphData.total_edges} / {(graphData.edges || []).length} edges
+                📊 {filteredGraphData.total_nodes} / {graphData.total_db_nodes || (graphData.nodes || []).length} concepts
+                · {filteredGraphData.total_edges} relations
               </div>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 {importanceFilter ? (

@@ -114,6 +114,32 @@ async def get_dashboard():
     qps = await database.fetch_all("question_papers")
     questions = await database.fetch_all("questions")
     mappings = await database.fetch_all("mappings")
+    answers = await database.fetch_all("answers")
+
+    # Knowledge Graph statistics
+    kg_concepts = await database.count("concepts")
+    kg_relations = await database.count("concept_relations")
+    kg_must_know = await database.count("concepts", where="importance = ?", params=("must_know",))
+
+    # Answers statistics
+    total_answers = len(answers)
+    total_questions = len(questions)
+    pct_answered = round((total_answers / total_questions * 100), 1) if total_questions > 0 else 0
+    
+    total_bullets = sum(a.get("bullet_count", 0) for a in answers)
+    avg_bullets = round(total_bullets / total_answers, 1) if total_answers > 0 else 0
+    
+    answer_modes = {"auto": 0, "graph_only": 0, "hybrid": 0}
+    for a in answers:
+        mode = a.get("retrieval_mode", "auto")
+        answer_modes[mode] = answer_modes.get(mode, 0) + 1
+
+    # Review progress
+    total_mappings = len(mappings)
+    count_reviewed = sum(1 for m in mappings if m.get("is_reviewed") == 1)
+    count_auto_accepted = sum(1 for m in mappings if m.get("reviewer_action") == "auto_accepted")
+    count_manually_reviewed = count_reviewed - count_auto_accepted
+    count_pending = total_mappings - count_reviewed
 
     # Confidence distribution
     conf_dist = {"high": 0, "medium": 0, "low": 0}
@@ -121,21 +147,59 @@ async def get_dashboard():
         level = m.get("confidence_level", "low")
         conf_dist[level] = conf_dist.get(level, 0) + 1
 
-    # Subjects summary
-    subjects = {}
+    # Per-subject drill-down
+    subject_details = {}
     for tb in textbooks:
         sub = tb["subject"]
-        if sub not in subjects:
-            subjects[sub] = {"textbooks": 0, "chapters": 0, "qps": 0, "questions": 0, "status": tb["status"]}
-        subjects[sub]["textbooks"] += 1
+        subject_details.setdefault(sub, {"textbooks": 0, "chapters": 0, "qps": 0, "questions": 0, "mappings": 0, "reviewed": 0, "answered": 0, "status": tb["status"]})
+        subject_details[sub]["textbooks"] += 1
 
+    chapter_subjects = {}
     for ch in chapters:
         tb = next((t for t in textbooks if t["id"] == ch.get("textbook_id")), None)
         if tb:
-            subjects.setdefault(tb["subject"], {})["chapters"] = subjects.get(tb["subject"], {}).get("chapters", 0) + 1
+            sub = tb["subject"]
+            chapter_subjects[ch["id"]] = sub
+            subject_details.setdefault(sub, {"textbooks": 0, "chapters": 0, "qps": 0, "questions": 0, "mappings": 0, "reviewed": 0, "answered": 0, "status": "active"})
+            subject_details[sub]["chapters"] += 1
 
+    qp_subjects = {}
     for qp in qps:
-        subjects.setdefault(qp["subject"], {})["qps"] = subjects.get(qp["subject"], {}).get("qps", 0) + 1
+        sub = qp["subject"]
+        qp_subjects[qp["id"]] = sub
+        subject_details.setdefault(sub, {"textbooks": 0, "chapters": 0, "qps": 0, "questions": 0, "mappings": 0, "reviewed": 0, "answered": 0, "status": "active"})
+        subject_details[sub]["qps"] += 1
+
+    for q in questions:
+        sub = qp_subjects.get(q.get("qp_id"))
+        if sub:
+            subject_details[sub]["questions"] += 1
+
+    mapping_subjects = {}
+    for m in mappings:
+        sub = qp_subjects.get(m.get("qp_id"))
+        if sub:
+            mapping_subjects[m["id"]] = sub
+            subject_details[sub]["mappings"] += 1
+            if m.get("is_reviewed") == 1:
+                subject_details[sub]["reviewed"] += 1
+
+    for a in answers:
+        sub = mapping_subjects.get(a.get("mapping_id"))
+        if sub:
+            subject_details[sub]["answered"] += 1
+
+    # Legacy subjects format for backwards compatibility
+    subjects_summary = []
+    for k, v in subject_details.items():
+        subjects_summary.append({
+            "name": k,
+            "textbooks": v["textbooks"],
+            "chapters": v["chapters"],
+            "qps": v["qps"],
+            "questions": v["questions"],
+            "status": v["status"]
+        })
 
     # Cost summary
     cost_summary = {"total_spent": 0, "budget_limit": settings.budget_limit, "breakdown": {}, "api_calls_made": 0}
@@ -154,12 +218,31 @@ async def get_dashboard():
         "total_chapters": len(chapters),
         "total_chunks": await database.count("chunks"),
         "total_qps": len(qps),
-        "total_questions": len(questions),
-        "total_matched": len(mappings),
+        "total_questions": total_questions,
+        "total_matched": total_mappings,
         "confidence_distribution": conf_dist,
-        "subjects": [{"name": k, **v} for k, v in subjects.items()],
+        "subjects": subjects_summary,
+        "subject_details": subject_details,
         "cost": cost_summary,
         "recent_activity": recent,
+        "kg_stats": {
+            "concepts": kg_concepts,
+            "relations": kg_relations,
+            "must_know": kg_must_know
+        },
+        "answer_stats": {
+            "total": total_answers,
+            "pct_answered": pct_answered,
+            "avg_bullets": avg_bullets,
+            "modes": answer_modes
+        },
+        "review_progress": {
+            "total": total_mappings,
+            "reviewed": count_reviewed,
+            "pending": count_pending,
+            "auto_accepted": count_auto_accepted,
+            "manually_reviewed": count_manually_reviewed
+        }
     }
 
 
@@ -269,6 +352,7 @@ async def upload_question_paper(
     university: str = Form(None),
     year: int = Form(None),
     month: str = Form(None),
+    schema: str = Form(None),
 ):
     """Upload and extract questions from a single QP."""
     task_id = str(uuid.uuid4())[:8]
@@ -286,7 +370,7 @@ async def upload_question_paper(
             result = await extract_questions_from_qp(
                 file_path=str(save_path),
                 subject=subject,
-                metadata_overrides={"university": university, "year": year, "month": month},
+                metadata_overrides={"university": university, "year": year, "month": month, "schema": schema},
                 progress_callback=progress_cb,
             )
             await send_progress(task_id, "done", 1, 1, json.dumps(result, default=str))
@@ -394,6 +478,16 @@ async def list_mappings(subject: str = None, confidence_level: str = None):
     where = " AND ".join(where_parts) if where_parts else ""
     mappings = await database.fetch_all("mappings", where, tuple(params), "confidence DESC")
 
+    # Fetch mapping IDs that have answers to populate has_answer field
+    answered_mapping_ids = set()
+    try:
+        ans_rows = await database.fetch_all("answers")
+        for row in ans_rows:
+            if row.get("mapping_id"):
+                answered_mapping_ids.add(row["mapping_id"])
+    except Exception:
+        pass
+
     # Parse JSON fields
     for m in mappings:
         for field in ["matched_chapters", "best_match", "appears_in_exams"]:
@@ -405,6 +499,7 @@ async def list_mappings(subject: str = None, confidence_level: str = None):
         # SQLite stores booleans as 0/1 — coerce to real booleans
         m["is_reviewed"] = bool(m.get("is_reviewed"))
         m["is_multi_chapter"] = bool(m.get("is_multi_chapter"))
+        m["has_answer"] = m["id"] in answered_mapping_ids
     return mappings
 
 
@@ -604,6 +699,18 @@ async def get_settings():
         "embedding_model": env.get("EMBEDDING_MODEL", settings.embedding_model),
         "backend_port": int(env.get("BACKEND_PORT", settings.backend_port)),
         "frontend_url": env.get("FRONTEND_URL", settings.frontend_url),
+        
+        # New Settings Fields
+        "default_answer_mode": env.get("DEFAULT_ANSWER_MODE", settings.default_answer_mode),
+        "default_answer_preset": env.get("DEFAULT_ANSWER_PRESET", settings.default_answer_preset),
+        "answer_temperature": float(env.get("ANSWER_TEMPERATURE", settings.answer_temperature)),
+        "kg_extraction_model": env.get("KG_EXTRACTION_MODEL", settings.kg_extraction_model),
+        "kg_max_concepts_per_batch": int(env.get("KG_MAX_CONCEPTS_PER_BATCH", settings.kg_max_concepts_per_batch)),
+        "kg_enable_relation_extraction": env.get("KG_ENABLE_RELATION_EXTRACTION", str(settings.kg_enable_relation_extraction)).lower() == "true",
+        "kg_default_limit": int(env.get("KG_DEFAULT_LIMIT", settings.kg_default_limit)),
+        "fs_collection_prefix": env.get("FS_COLLECTION_PREFIX", settings.fs_collection_prefix),
+        "imagekit_folder": env.get("IMAGEKIT_FOLDER", settings.imagekit_folder),
+        
         "cost": cost_info,
     }
 
@@ -626,6 +733,17 @@ async def update_settings(data: dict):
         "embedding_model": "EMBEDDING_MODEL",
         "backend_port": "BACKEND_PORT",
         "frontend_url": "FRONTEND_URL",
+        
+        # New Settings Fields
+        "default_answer_mode": "DEFAULT_ANSWER_MODE",
+        "default_answer_preset": "DEFAULT_ANSWER_PRESET",
+        "answer_temperature": "ANSWER_TEMPERATURE",
+        "kg_extraction_model": "KG_EXTRACTION_MODEL",
+        "kg_max_concepts_per_batch": "KG_MAX_CONCEPTS_PER_BATCH",
+        "kg_enable_relation_extraction": "KG_ENABLE_RELATION_EXTRACTION",
+        "kg_default_limit": "KG_DEFAULT_LIMIT",
+        "fs_collection_prefix": "FS_COLLECTION_PREFIX",
+        "imagekit_folder": "IMAGEKIT_FOLDER",
     }
 
     changed = []
@@ -654,8 +772,67 @@ async def update_settings(data: dict):
             settings.chunk_size = int(data["chunk_size"])
         if "chunk_overlap" in changed:
             settings.chunk_overlap = int(data["chunk_overlap"])
+            
+        # Hot-reload new configuration fields
+        if "default_answer_mode" in changed:
+            settings.default_answer_mode = data["default_answer_mode"]
+        if "default_answer_preset" in changed:
+            settings.default_answer_preset = data["default_answer_preset"]
+        if "answer_temperature" in changed:
+            settings.answer_temperature = float(data["answer_temperature"])
+        if "kg_extraction_model" in changed:
+            settings.kg_extraction_model = data["kg_extraction_model"]
+        if "kg_max_concepts_per_batch" in changed:
+            settings.kg_max_concepts_per_batch = int(data["kg_max_concepts_per_batch"])
+        if "kg_enable_relation_extraction" in changed:
+            settings.kg_enable_relation_extraction = str(data["kg_enable_relation_extraction"]).lower() == "true"
+        if "kg_default_limit" in changed:
+            settings.kg_default_limit = int(data["kg_default_limit"])
+        if "fs_collection_prefix" in changed:
+            settings.fs_collection_prefix = data["fs_collection_prefix"]
+        if "imagekit_folder" in changed:
+            settings.imagekit_folder = data["imagekit_folder"]
 
     return {"status": "ok", "changed": changed, "message": f"Updated {len(changed)} setting(s), saved to .env"}
+
+
+@app.get("/api/settings/sysinfo")
+async def api_settings_sysinfo():
+    """Get system stats for settings page."""
+    import sys
+    import shutil
+    import os
+    import importlib.metadata
+
+    packages = ["fastapi", "anthropic", "aiosqlite", "chromadb", "pydantic", "firebase-admin"]
+    versions = {}
+    for pkg in packages:
+        try:
+            versions[pkg] = importlib.metadata.version(pkg)
+        except Exception:
+            versions[pkg] = "not installed"
+
+    db_size_mb = 0
+    if os.path.exists(settings.db_path):
+        db_size_mb = os.path.getsize(settings.db_path) / (1024 * 1024)
+
+    total, used, free = shutil.disk_usage(str(settings.data_dir))
+    disk_stats = {
+        "total_gb": round(total / (1024**3), 1),
+        "used_gb": round(used / (1024**3), 1),
+        "free_gb": round(free / (1024**3), 1),
+        "pct_used": round((used / total) * 100, 1)
+    }
+
+    chunk_count = await database.count("chunks")
+
+    return {
+        "python_version": sys.version.split()[0],
+        "package_versions": versions,
+        "database_size_mb": round(db_size_mb, 2),
+        "disk_usage": disk_stats,
+        "vector_chunks": chunk_count,
+    }
 
 
 # ── Textbook Chapter Details ──────────────────────────────────────
@@ -1084,6 +1261,7 @@ async def api_qb_push_firestore(
     subject = body.get("subject")
     mapping_ids = body.get("mapping_ids")  # Optional: specific IDs
     upload_images = body.get("upload_images", True)
+    dry_run = body.get("dry_run", False)
 
     if not subject:
         raise HTTPException(400, "subject is required")
@@ -1101,6 +1279,7 @@ async def api_qb_push_firestore(
                 mapping_ids=mapping_ids,
                 upload_images=upload_images,
                 progress_callback=progress_cb,
+                dry_run=dry_run,
             )
             await send_progress(task_id, "done", 1, 1, json.dumps(result))
         except Exception as e:
@@ -1599,7 +1778,7 @@ async def api_kg_graph(
     graph = await get_graph_for_subject(
         subject=subject,
         concept_type=concept_type,
-        limit=min(limit, 300),
+        limit=min(limit, 1000),
     )
     return graph
 

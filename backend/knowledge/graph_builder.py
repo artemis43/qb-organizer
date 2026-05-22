@@ -43,6 +43,13 @@ VALID_RELATION_TYPES = {
     "synonym_of",         # SCA → Sickle Cell Anemia
     "precedes",           # Dysplasia → Malignancy
     "managed_by",         # Shock → IV Fluids, O2
+    "produces",           # Beta cells → Insulin
+    "metabolized_by",     # Bilirubin → Liver
+    "innervated_by",      # Deltoid → Axillary nerve
+    "vascularized_by",    # Heart → Coronary arteries
+    "contraindicated_in", # Aspirin → Peptic ulcer
+    "indicated_in",       # Antibiotics → Infection
+    "side_effect_of",     # Cough → ACE inhibitors
 }
 
 VALID_CONCEPT_TYPES = {
@@ -84,6 +91,14 @@ RELATION TYPES (use exactly):
 - differential_of: differential diagnosis relationship
 - risk_factor_for: risk factor → disease
 - precedes: temporal/causal sequence
+- managed_by: general management
+- produces: physiological production (e.g., organ/cell produces hormone/substance)
+- metabolized_by: metabolic clearance (e.g., substance metabolized by organ/enzyme)
+- innervated_by: nervous supply (e.g., muscle/structure innervated by nerve)
+- vascularized_by: blood supply (e.g., organ/structure vascularized by artery/vein)
+- contraindicated_in: warning/danger (e.g., drug contraindicated in condition/disease)
+- indicated_in: clinical indication (e.g., drug/procedure indicated in condition/disease)
+- side_effect_of: adverse effect (e.g., symptom/sign side effect of drug)
 
 CRITICAL RULES:
 1. Extract ALL concepts mentioned — from "bone" to "Osteosarcoma"
@@ -283,6 +298,13 @@ RELATION TYPES (use exactly):
 - risk_factor_for: risk factor → disease. E.g., "Osteoporosis" → "Pathological Fracture"
 - precedes: temporal/causal sequence. E.g., "Inflammation" → "Fibrosis"
 - managed_by: general management. E.g., "Pain" → "NSAIDs"
+- produces: physiological production. E.g., "Beta Cells" → "Insulin"
+- metabolized_by: metabolic clearance. E.g., "Bilirubin" → "Liver"
+- innervated_by: nervous supply. E.g., "Deltoid" → "Axillary Nerve"
+- vascularized_by: blood supply. E.g., "Heart" → "Coronary Arteries"
+- contraindicated_in: warning/danger. E.g., "Aspirin" → "Peptic Ulcer"
+- indicated_in: clinical indication. E.g., "Antibiotics" → "Infection"
+- side_effect_of: adverse effect. E.g., "Cough" → "ACE Inhibitors"
 
 RULES:
 1. ONLY use concept names from the provided list (exact match)
@@ -1049,8 +1071,9 @@ async def get_graph_for_subject(subject: str, concept_type: str = None, limit: i
         where += " AND concept_type = ?"
         params.append(concept_type)
 
-    concepts = await database.fetch_all("concepts", where, tuple(params), "frequency DESC")
-    concepts = concepts[:limit]
+    concepts_all = await database.fetch_all("concepts", where, tuple(params), "frequency DESC")
+    total_db_nodes = len(concepts_all)
+    concepts = concepts_all[:limit]
     concept_ids = {c["id"] for c in concepts}
 
     # Get relations between these concepts
@@ -1096,6 +1119,7 @@ async def get_graph_for_subject(subject: str, concept_type: str = None, limit: i
         "subject": subject,
         "total_nodes": len(nodes),
         "total_edges": len(edges),
+        "total_db_nodes": total_db_nodes,
     }
 
 

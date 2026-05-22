@@ -31,6 +31,21 @@ class Settings(BaseSettings):
     backend_port: int = 8000
     frontend_url: str = "http://localhost:3000"
 
+    # --- Answer Generation ---
+    default_answer_mode: str = "auto"
+    default_answer_preset: str = "SAQ"
+    answer_temperature: float = 0.3
+
+    # --- Knowledge Graph ---
+    kg_extraction_model: str = "haiku"
+    kg_max_concepts_per_batch: int = 50
+    kg_enable_relation_extraction: bool = True
+    kg_default_limit: int = 150
+
+    # --- Export / Deploy ---
+    fs_collection_prefix: str = ""
+    imagekit_folder: str = "/qb-organizer"
+
     # --- Paths ---
     data_dir: Path = DATA_DIR
     chroma_dir: Path = DATA_DIR / "chroma_db"

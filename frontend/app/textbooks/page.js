@@ -1,6 +1,6 @@
 "use client";
 import { useState, useEffect, useRef } from "react";
-import { uploadTextbook, getTextbooks, getTextbookChapters, checkTextbookBatch, deleteTextbook, connectProgress } from "@/lib/api";
+import { uploadTextbook, getTextbooks, getTextbookChapters, checkTextbookBatch, deleteTextbook, connectProgress, getSubjects } from "@/lib/api";
 
 export default function TextbooksPage() {
   const [textbooks, setTextbooks] = useState([]);
@@ -200,10 +200,24 @@ function UploadForm({ onClose, onSuccess }) {
   const [file, setFile] = useState(null);
   const [name, setName] = useState("");
   const [subject, setSubject] = useState("");
+  const [subjectsList, setSubjectsList] = useState([]);
+  const [selectedSubjectOpt, setSelectedSubjectOpt] = useState("");
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState(null);
   const fileRef = useRef(null);
   const [dragOver, setDragOver] = useState(false);
+
+  useEffect(() => {
+    async function fetchSubjects() {
+      try {
+        const data = await getSubjects();
+        setSubjectsList(data || []);
+      } catch (e) {
+        console.error("Failed to load subjects", e);
+      }
+    }
+    fetchSubjects();
+  }, []);
 
   function handleDrop(e) {
     e.preventDefault(); setDragOver(false);
@@ -216,10 +230,11 @@ function UploadForm({ onClose, onSuccess }) {
 
   async function handleSubmit(e) {
     e.preventDefault();
-    if (!file || !name || !subject) return;
+    const finalSubject = selectedSubjectOpt === "__custom__" ? subject : selectedSubjectOpt;
+    if (!file || !name || !finalSubject) return;
     setUploading(true);
     try {
-      const result = await uploadTextbook(file, name, subject);
+      const result = await uploadTextbook(file, name, finalSubject);
       if (result.task_id) {
         connectProgress(result.task_id, (data) => {
           setProgress(data);
@@ -233,44 +248,83 @@ function UploadForm({ onClose, onSuccess }) {
   }
 
   return (
-    <div className="card" style={{ marginBottom: 20 }}>
-      <div className="card-header">
-        <span className="card-title">Upload Textbook</span>
-        <button className="btn btn-secondary btn-sm" onClick={onClose}>✕</button>
-      </div>
-      <form onSubmit={handleSubmit}>
-        <div className={`file-upload-zone ${dragOver ? "drag-over" : ""}`}
-          onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-          onDragLeave={() => setDragOver(false)} onDrop={handleDrop}
-          onClick={() => fileRef.current.click()} style={{ marginBottom: 14 }}>
-          <input ref={fileRef} type="file" accept=".pdf" style={{ display: "none" }}
-            onChange={(e) => { const f = e.target.files[0]; if (f) { setFile(f); if (!name) setName(f.name.replace(/\.pdf$/i, "").replace(/[_-]/g, " ")); } }} />
-          {file ? (
-            <><div className="file-upload-icon">✅</div><div className="file-upload-text">{file.name}</div><div className="file-upload-hint">{(file.size/1024/1024).toFixed(1)} MB</div></>
-          ) : (
-            <><div className="file-upload-icon">📕</div><div className="file-upload-text">Drop a textbook PDF here or click to select</div><div className="file-upload-hint">Supports digital PDFs with selectable text</div></>
+    <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="modal-box" style={{ width: 560, padding: 24 }}>
+        <div className="card-header" style={{ marginBottom: 16, borderBottom: "1px solid var(--border)", paddingBottom: 12 }}>
+          <span className="card-title">Upload Textbook</span>
+          <button className="btn btn-secondary btn-sm" onClick={onClose}>✕</button>
+        </div>
+        <form onSubmit={handleSubmit}>
+          <div className={`file-upload-zone ${dragOver ? "drag-over" : ""}`}
+            onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+            onDragLeave={() => setDragOver(false)} onDrop={handleDrop}
+            onClick={() => fileRef.current.click()} style={{ marginBottom: 14 }}>
+            <input ref={fileRef} type="file" accept=".pdf" style={{ display: "none" }}
+              onChange={(e) => { const f = e.target.files[0]; if (f) { setFile(f); if (!name) setName(f.name.replace(/\.pdf$/i, "").replace(/[_-]/g, " ")); } }} />
+            {file ? (
+              <><div className="file-upload-icon">✅</div><div className="file-upload-text">{file.name}</div><div className="file-upload-hint">{(file.size/1024/1024).toFixed(1)} MB</div></>
+            ) : (
+              <><div className="file-upload-icon">📕</div><div className="file-upload-text">Drop a textbook PDF here or click to select</div><div className="file-upload-hint">Supports digital PDFs with selectable text</div></>
+            )}
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 14, marginBottom: 20 }}>
+            <div className="input-group">
+              <label className="input-label">Textbook Name</label>
+              <input className="input" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Maheswari's Essential Orthopaedics" required />
+            </div>
+            
+            <div className="input-group">
+              <label className="input-label">Subject</label>
+              {subjectsList.length > 0 ? (
+                <select
+                  className="select"
+                  value={selectedSubjectOpt}
+                  onChange={(e) => {
+                    const opt = e.target.value;
+                    setSelectedSubjectOpt(opt);
+                    if (opt !== "__custom__") {
+                      setSubject(opt);
+                    } else {
+                      setSubject("");
+                    }
+                  }}
+                  required
+                >
+                  <option value="">Select subject...</option>
+                  {subjectsList.map((s, idx) => (
+                    <option key={idx} value={s.name || s.subject || s}>
+                      {s.name || s.subject || s}
+                    </option>
+                  ))}
+                  <option value="__custom__">+ Add new subject...</option>
+                </select>
+              ) : (
+                <input className="input" value={subject} onChange={e => setSubject(e.target.value)} placeholder="e.g. Orthopaedics" required />
+              )}
+
+              {(selectedSubjectOpt === "__custom__" || subjectsList.length === 0) && (
+                <input
+                  className="input"
+                  value={subject}
+                  onChange={e => setSubject(e.target.value)}
+                  placeholder="Enter new subject name"
+                  style={{ marginTop: 8 }}
+                  required
+                />
+              )}
+            </div>
+          </div>
+          {progress && (
+            <div style={{ marginBottom: 14 }}>
+              <div className="progress-bar-container"><div className="progress-bar-fill" style={{ width: `${progress.percentage || 0}%` }} /></div>
+              <div className="progress-text"><span style={{ maxWidth: "80%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{progress.message}</span><span>{(progress.percentage||0).toFixed(0)}%</span></div>
+            </div>
           )}
-        </div>
-        <div className="grid-2">
-          <div className="input-group">
-            <label className="input-label">Textbook Name</label>
-            <input className="input" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Maheswari's Essential Orthopaedics" required />
-          </div>
-          <div className="input-group">
-            <label className="input-label">Subject</label>
-            <input className="input" value={subject} onChange={e => setSubject(e.target.value)} placeholder="e.g. Orthopaedics" required />
-          </div>
-        </div>
-        {progress && (
-          <div style={{ marginBottom: 14 }}>
-            <div className="progress-bar-container"><div className="progress-bar-fill" style={{ width: `${progress.percentage || 0}%` }} /></div>
-            <div className="progress-text"><span style={{ maxWidth: "80%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{progress.message}</span><span>{(progress.percentage||0).toFixed(0)}%</span></div>
-          </div>
-        )}
-        <button className="btn btn-primary" type="submit" disabled={uploading || !file || !name || !subject}>
-          {uploading ? "Processing..." : "Upload & Process"}
-        </button>
-      </form>
+          <button className="btn btn-primary" type="submit" style={{ width: "100%" }} disabled={uploading || !file || !name || !(selectedSubjectOpt === "__custom__" ? subject : selectedSubjectOpt)}>
+            {uploading ? "Processing..." : "Upload & Process"}
+          </button>
+        </form>
+      </div>
     </div>
   );
 }

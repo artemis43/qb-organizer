@@ -25,9 +25,31 @@ export default function Graph3D({ nodes, edges, onSelectNode, selectedNodeId, he
   const fgRef = useRef();
   const [hoveredNodeId, setHoveredNodeId] = useState(null);
   const [showLabels, setShowLabels] = useState(true);
+  const [showEdgeLabels, setShowEdgeLabels] = useState(false);
   const [enableParticles, setEnableParticles] = useState(true);
+  const [isFrozen, setIsFrozen] = useState(false);
   const [dimensions, setDimensions] = useState({ width: 800, height: typeof height === "number" ? height : 520 });
   const containerRef = useRef(null);
+
+  const toggleFreeze = () => {
+    if (!fgRef.current) return;
+    if (isFrozen) {
+      fgRef.current.resumeAnimation();
+      fgRef.current.d3ReheatSimulation();
+      setIsFrozen(false);
+    } else {
+      fgRef.current.pauseAnimation();
+      fgRef.current.d3StopSimulation();
+      setIsFrozen(true);
+    }
+  };
+
+  useEffect(() => {
+    if (isFrozen && fgRef.current) {
+      fgRef.current.resumeAnimation();
+      setIsFrozen(false);
+    }
+  }, [nodes, edges]);
 
   // Resize handler to fit container
   useEffect(() => {
@@ -47,8 +69,23 @@ export default function Graph3D({ nodes, edges, onSelectNode, selectedNodeId, he
 
   // Format data for react-force-graph-3d (shallow clone to prevent mutating react state)
   const graphData = useMemo(() => {
+    const typeAngles = {};
+    const types = [...new Set((nodes || []).map(n => n.concept_type))];
+    types.forEach((t, i) => {
+      typeAngles[t] = (i / types.length) * Math.PI * 2;
+    });
+
     return {
-      nodes: (nodes || []).map((n) => ({ ...n })),
+      nodes: (nodes || []).map((n) => {
+        const angle = typeAngles[n.concept_type] || 0;
+        const radius = 120 + Math.random() * 60;
+        return {
+          ...n,
+          x: n.x !== undefined ? n.x : radius * Math.cos(angle),
+          y: n.y !== undefined ? n.y : radius * Math.sin(angle),
+          z: n.z !== undefined ? n.z : (Math.random() - 0.5) * 100,
+        };
+      }),
       links: (edges || []).map((e) => ({
         source: e.source,
         target: e.target,
@@ -246,6 +283,39 @@ export default function Graph3D({ nodes, edges, onSelectNode, selectedNodeId, he
     [selectedNodeId, hoveredNodeId, showLabels]
   );
 
+  // Link relation labels generator
+  const linkThreeObject = useCallback(link => {
+    if (!showEdgeLabels) return null;
+    const canvas = document.createElement("canvas");
+    canvas.width = 256;
+    canvas.height = 64;
+    const ctx = canvas.getContext("2d");
+    ctx.font = "bold 22px 'Inter', sans-serif";
+    ctx.fillStyle = "rgba(167, 139, 250, 0.9)";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.shadowColor = "rgba(0, 0, 0, 0.9)";
+    ctx.shadowBlur = 5;
+    
+    const displayLabel = link.relation_type.replace(/_/g, ' ');
+    ctx.fillText(displayLabel, 128, 32);
+    
+    const texture = new THREE.CanvasTexture(canvas);
+    const spriteMat = new THREE.SpriteMaterial({ map: texture, depthWrite: false });
+    const sprite = new THREE.Sprite(spriteMat);
+    sprite.scale.set(13, 3.25, 1);
+    return sprite;
+  }, [showEdgeLabels]);
+
+  const linkPositionUpdate = useCallback((sprite, { start, end }) => {
+    if (!sprite) return;
+    sprite.position.set(
+      (start.x + end.x) / 2,
+      (start.y + end.y) / 2 + 2,
+      (start.z + end.z) / 2
+    );
+  }, []);
+
   return (
     <div
       ref={containerRef}
@@ -287,6 +357,13 @@ export default function Graph3D({ nodes, edges, onSelectNode, selectedNodeId, he
           ⟳
         </button>
         <button
+          onClick={toggleFreeze}
+          style={{ ...toolBtnStyle, color: isFrozen ? "#f87171" : "#64748b" }}
+          title={isFrozen ? "Resume Layout Physics" : "Freeze Layout Physics"}
+        >
+          {isFrozen ? "▶️" : "❄️"}
+        </button>
+        <button
           onClick={() => {
             setShowLabels(!showLabels);
             if (fgRef.current) fgRef.current.refresh();
@@ -295,6 +372,16 @@ export default function Graph3D({ nodes, edges, onSelectNode, selectedNodeId, he
           title={showLabels ? "Hide All Labels" : "Show All Labels"}
         >
           Aa
+        </button>
+        <button
+          onClick={() => {
+            setShowEdgeLabels(!showEdgeLabels);
+            if (fgRef.current) fgRef.current.refresh();
+          }}
+          style={{ ...toolBtnStyle, color: showEdgeLabels ? "#a78bfa" : "#64748b" }}
+          title={showEdgeLabels ? "Hide Edge Labels" : "Show Edge Labels"}
+        >
+          🏷️
         </button>
         <button
           onClick={() => setEnableParticles(!enableParticles)}
@@ -364,9 +451,12 @@ export default function Graph3D({ nodes, edges, onSelectNode, selectedNodeId, he
         // Link/Edge config
         linkColor={() => "rgba(96, 165, 250, 0.12)"}
         linkWidth={1.2}
+        linkLabel={(link) => `${link.relation_type.replace(/_/g, ' ')} (${Math.round((link.confidence || 0.9) * 100)}% confidence)`}
         linkDirectionalArrowLength={4}
         linkDirectionalArrowColor={() => "rgba(96, 165, 250, 0.4)"}
         linkDirectionalArrowRelPos={1} // Put arrow head directly at target node edge
+        linkThreeObject={showEdgeLabels ? linkThreeObject : null}
+        linkPositionUpdate={showEdgeLabels ? linkPositionUpdate : null}
 
         // Premium particle animation flow along relations
         linkDirectionalParticles={enableParticles ? 2 : 0}
@@ -376,6 +466,9 @@ export default function Graph3D({ nodes, edges, onSelectNode, selectedNodeId, he
 
         // Simulation parameters
         cooldownTicks={100}
+        warmupTicks={50}
+        d3AlphaDecay={0.04}
+        d3VelocityDecay={0.3}
         onBackgroundClick={handleBackgroundClick}
       />
     </div>

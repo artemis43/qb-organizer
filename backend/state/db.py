@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS question_papers (
     year INTEGER,
     month TEXT,
     paper_number TEXT,
+    schema TEXT,
     total_pages INTEGER DEFAULT 0,
     total_questions INTEGER DEFAULT 0,
     sha256_hash TEXT UNIQUE NOT NULL,
@@ -321,6 +322,17 @@ async def init_db():
                 await db.execute("ALTER TABLE answers ADD COLUMN retrieval_metadata TEXT")
                 await db.commit()
                 logger.info("Migration: added retrieval_mode/retrieval_metadata to answers")
+            except Exception:
+                pass
+
+        # Migration: add schema to question_papers
+        try:
+            await db.execute("SELECT schema FROM question_papers LIMIT 1")
+        except Exception:
+            try:
+                await db.execute("ALTER TABLE question_papers ADD COLUMN schema TEXT")
+                await db.commit()
+                logger.info("Migration: added schema column to question_papers")
             except Exception:
                 pass
 
